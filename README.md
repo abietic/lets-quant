@@ -24,6 +24,8 @@
 - 对实验目录执行路径安全、逐文件哈希、case 身份、摘要绑定和 CSV 日期轴验证。
 - 为合成、CSV 和清洗数据集实验冻结规范市场输入并重跑，逐位核对输入 ID、结果
   哈希和 summary。
+- 验证两个实验后按完整 case contract 对齐，输出输入差异和方向明确的逐 case
+  指标差，不自动评优。
 - 带严格输入指纹和差异报告的跨引擎候选产物契约与对账器。
 - 可选 VectorBT 1.1.0 适配器，消费独立 CSV 或清洗数据集，复核停牌拒绝、成交、
   企业行动回调、费用、持仓和 NAV。
@@ -54,6 +56,7 @@ make m15-demo
 make m2-demo
 make experiment-verify-demo
 make experiment-replay-demo
+make experiment-compare-demo
 make paper-demo
 make paper-audit-demo
 ```
@@ -207,6 +210,21 @@ PYTHONPATH=src python3 -m lets_quant replay-experiment \
 相同策略、实验定义、市场、源码和完整 Python 版本应产生相同输入 ID 与结果哈希。
 目录时间戳可以不同；跨运行时比较必须读取 manifest 的 Python 版本，不能把末位
 浮点差异误报成同环境重放失败。
+
+比较两个现有实验：
+
+```bash
+PYTHONPATH=src python3 -m lets_quant compare-experiments \
+  --baseline-run artifacts/experiments/<baseline-run-id> \
+  --candidate-run artifacts/experiments/<candidate-run-id> \
+  --report-out artifacts/comparisons/<comparison-id>.json
+```
+
+比较器先验证两边目录，再分别报告策略、实验、市场 lineage 和运行时差异。只有
+窗口日期、角色、fold、执行场景和参数变体全部一致的 case 才计算
+`candidate - baseline` 指标差；报告固定保持 `ranking_performed=false` 和
+`preferred_experiment=null`。完整契约见
+[实验差异报告](docs/EXPERIMENT_COMPARISON.md)。
 
 ## M2 参数稳定性实验
 
@@ -459,6 +477,7 @@ AKShare 的 MIT 许可是代码许可，不等于其上游行情的再分发或�
 - [Bootstrap 不确定性](docs/BOOTSTRAP_UNCERTAINTY.md)
 - [实验产物验证](docs/EXPERIMENT_VERIFICATION.md)
 - [实验离线重放](docs/EXPERIMENT_REPLAY.md)
+- [实验差异报告](docs/EXPERIMENT_COMPARISON.md)
 - [跨引擎验证](docs/CROSS_ENGINE_VALIDATION.md)
 - [离线 Paper 运营审计](docs/PAPER_OPERATIONS.md)
 

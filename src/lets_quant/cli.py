@@ -38,6 +38,10 @@ from .experiments import (
     market_identity,
     run_experiment,
 )
+from .experiment_comparison import (
+    compare_experiment_artifacts,
+    write_experiment_comparison_report,
+)
 from .experiment_replay import replay_experiment_artifacts
 from .experiment_verification import verify_experiment_artifacts
 from .execution import (
@@ -203,6 +207,18 @@ def build_parser() -> argparse.ArgumentParser:
     replay_experiment.add_argument(
         "--experiment-run", type=Path, required=True
     )
+
+    compare_experiments = subcommands.add_parser(
+        "compare-experiments",
+        help="compare verified experiment inputs and aligned case metrics",
+    )
+    compare_experiments.add_argument(
+        "--baseline-run", type=Path, required=True
+    )
+    compare_experiments.add_argument(
+        "--candidate-run", type=Path, required=True
+    )
+    compare_experiments.add_argument("--report-out", type=Path)
 
     plan = subcommands.add_parser(
         "plan-orders",
@@ -681,6 +697,29 @@ def _replay_experiment(args: argparse.Namespace) -> int:
     return 0
 
 
+def _compare_experiments(args: argparse.Namespace) -> int:
+    report = compare_experiment_artifacts(
+        args.baseline_run, args.candidate_run
+    )
+    if args.report_out is not None:
+        write_experiment_comparison_report(report, args.report_out)
+        payload = {
+            "status": report["status"],
+            "comparison_status": report["comparison_status"],
+            "report_path": str(args.report_out.resolve()),
+            "report_sha256": report["report_sha256"],
+            "summary": report["summary"],
+            "descriptive_only": True,
+            "ranking_performed": False,
+            "investment_validity_established": False,
+            "automatic_execution_allowed": False,
+        }
+    else:
+        payload = report
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
 def _plan_orders(args: argparse.Namespace) -> int:
     policy = load_policy(args.policy)
     market, prices_path, dataset_manifest, _, _ = _load_market_source(
@@ -902,6 +941,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _verify_experiment(args)
         if args.command == "replay-experiment":
             return _replay_experiment(args)
+        if args.command == "compare-experiments":
+            return _compare_experiments(args)
         if args.command == "plan-orders":
             return _plan_orders(args)
         if args.command == "replay-paper-events":

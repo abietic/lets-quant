@@ -1,7 +1,7 @@
 PYTHON ?= python3
 PYTHONPATH := $(CURDIR)/src
 
-.PHONY: check compile lint test validate demo plan m1-validate m1-demo m15-demo m2-demo experiment-verify-demo experiment-replay-demo paper-demo paper-audit-demo vectorbt-test vectorbt-demo rqalpha-test rqalpha-demo
+.PHONY: check compile lint test validate demo plan m1-validate m1-demo m15-demo m2-demo experiment-verify-demo experiment-replay-demo experiment-compare-demo paper-demo paper-audit-demo vectorbt-test vectorbt-demo rqalpha-test rqalpha-demo
 
 check: compile test
 
@@ -98,6 +98,26 @@ experiment-replay-demo:
 		| $(PYTHON) -c 'import json,sys; print(json.load(sys.stdin)["artifact_directory"])')"; \
 	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant replay-experiment \
 		--experiment-run "$$experiment_dir"
+
+experiment-compare-demo:
+	@set -eu; \
+	baseline_dir="$$(PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant run-experiment \
+		--policy config/policy.momentum.example.json \
+		--experiment config/experiment.m1_5.example.json \
+		--scenario regime_shift \
+		--scenario-start 2022-01-03 \
+		--scenario-trading-days 780 \
+		| $(PYTHON) -c 'import json,sys; print(json.load(sys.stdin)["artifact_directory"])')"; \
+	candidate_dir="$$(PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant run-experiment \
+		--policy config/policy.momentum.example.json \
+		--experiment config/experiment.m1_5.example.json \
+		--scenario trend_up \
+		--scenario-start 2022-01-03 \
+		--scenario-trading-days 780 \
+		| $(PYTHON) -c 'import json,sys; print(json.load(sys.stdin)["artifact_directory"])')"; \
+	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant compare-experiments \
+		--baseline-run "$$baseline_dir" \
+		--candidate-run "$$candidate_dir"
 
 paper-demo:
 	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant replay-paper-events \
