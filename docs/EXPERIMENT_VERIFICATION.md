@@ -29,19 +29,22 @@ make experiment-verify-demo
 3. manifest 文件清单必须排序、唯一，并与磁盘实际文件集合完全一致；缺失、额外
    或不受支持的根文件/case 文件都会失败。
 4. 除 manifest 自身外，每个文件都必须匹配 `file_sha256`。
-5. 根 summary 的 case 数、case ID 和每个目录必须一一对应；case 目录后缀绑定
+5. schema v2 的 `replay_input` 必须绑定 `market.snapshot.json` 的文件哈希、规范
+   市场哈希、来源类型和来源哈希；清洗数据集还必须声明 dataset snapshot。
+6. 根 summary 的 case 数、case ID 和每个目录必须一一对应；case 目录后缀绑定
    `case_id`，snapshot 必须绑定同一 `result_sha256`。
-6. case summary、case snapshot 和 `bootstrap_uncertainty.json` 必须完全一致；
+7. case summary、case snapshot 和 `bootstrap_uncertainty.json` 必须完全一致；
    bootstrap 启用/禁用字段、区间顺序、协议、哈希和无基准语义必须自洽。
-7. summary 指标必须匹配 `metrics.json`；总成本重新由佣金、卖出税和滑点相加。
-8. CSV 表头、行宽和计数必须满足契约。NAV 日期唯一递增且位于评估窗口内；会计
+8. summary 指标必须匹配 `metrics.json`；总成本重新由佣金、卖出税和滑点相加。
+9. CSV 表头、行宽和计数必须满足契约。NAV 日期唯一递增且位于评估窗口内；会计
    日期必须等于 NAV，启用的阶段归因日期必须等于 NAV 的相邻收益日期。
-9. 所有 case 的 bootstrap 和市场阶段协议/基准必须一致；test 计数与根摘要绑定，
+10. 所有 case 的 bootstrap 和市场阶段协议/基准必须一致；test 计数与根摘要绑定，
    非 test case 不得启用 bootstrap。
 
-新产物写入 `artifact_schema_version=1`。v0.15 已经包含完整 `file_sha256` 的目录
-没有 schema 字段，验证器会将其报告为 `artifact_schema_version=0` 和
-`legacy_schema_inferred=true`。更早、不含实验逐文件哈希的目录不会被降级接受。
+新产物写入 `artifact_schema_version=2`。v0.16-v0.17 的 schema v1 和 v0.15 已经
+包含完整 `file_sha256`、但没有 schema 字段的目录仍可验证；后者会报告为
+`artifact_schema_version=0` 和 `legacy_schema_inferred=true`。更早、不含实验
+逐文件哈希的目录不会被降级接受。
 
 ## 报告语义
 
@@ -52,6 +55,8 @@ make experiment-verify-demo
   "status": "pass",
   "file_hashes_verified": true,
   "cross_file_consistency_verified": true,
+  "replay_input_available": true,
+  "replay_input_verified": true,
   "replay_performed": false,
   "artifact_authenticity_verified": false,
   "investment_validity_established": false,

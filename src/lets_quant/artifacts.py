@@ -28,6 +28,16 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _canonical_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _git_revision(path: Path) -> Optional[str]:
     try:
         completed = subprocess.run(
@@ -512,6 +522,16 @@ def write_experiment_artifacts(
     market_snapshot: Optional[Mapping[str, Any]] = None,
     dataset_manifest: Optional[Mapping[str, Any]] = None,
 ) -> Path:
+    if market_snapshot is None:
+        raise ValueError(
+            "experiment artifacts require an embedded replay market snapshot"
+        )
+    source_type = market_source.get("type")
+    if not isinstance(source_type, str) or not source_type.strip():
+        raise ValueError("experiment market source type must not be empty")
+    market_payload = market_snapshot.get("market")
+    if not isinstance(market_payload, Mapping):
+        raise ValueError("experiment replay market snapshot is malformed")
     policy_hash = _file_sha256(policy_path)
     experiment_hash = _file_sha256(experiment_path)
     project_root = _find_project_root(policy_path)
@@ -519,14 +539,7 @@ def write_experiment_artifacts(
     source_hash = (
         _file_sha256(market_source_path)
         if market_source_path is not None
-        else hashlib.sha256(
-            json.dumps(
-                market_snapshot,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-            ).encode("utf-8")
-        ).hexdigest()
+        else _canonical_sha256(market_snapshot)
     )
     experiment_id = hashlib.sha256(
         (
@@ -544,8 +557,7 @@ def write_experiment_artifacts(
     _write_json(destination / "policy.snapshot.json", policy.to_dict())
     if dataset_manifest is not None:
         _write_json(destination / "dataset.snapshot.json", dict(dataset_manifest))
-    if market_snapshot is not None:
-        _write_json(destination / "market.snapshot.json", dict(market_snapshot))
+    _write_json(destination / "market.snapshot.json", dict(market_snapshot))
 
     cases_root = destination / "cases"
     cases_root.mkdir()
@@ -647,7 +659,7 @@ def write_experiment_artifacts(
         destination / "manifest.json",
         {
             "artifact_type": "research_experiment",
-            "artifact_schema_version": 1,
+            "artifact_schema_version": 2,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "experiment_id": experiment_id,
             "experiment_input_id": result.experiment_input_id,
@@ -657,6 +669,14 @@ def write_experiment_artifacts(
             "experiment_path": str(experiment_path.resolve()),
             "experiment_sha256": experiment_hash,
             "market_source": source_payload,
+            "replay_input": {
+                "type": "embedded_market_snapshot",
+                "path": "market.snapshot.json",
+                "file_sha256": file_sha256["market.snapshot.json"],
+                "market_sha256": _canonical_sha256(market_payload),
+                "source_type": source_type,
+                "source_sha256": source_hash,
+            },
             "project_root": str(project_root),
             "source_revision": _git_revision(project_root),
             "source_tree_sha256": source_tree_hash,

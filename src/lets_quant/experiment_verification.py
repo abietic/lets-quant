@@ -28,6 +28,14 @@ _ROOT_OPTIONAL_FILES = {
     "dataset.snapshot.json",
     "market.snapshot.json",
 }
+_REPLAY_INPUT_KEYS = {
+    "file_sha256",
+    "market_sha256",
+    "path",
+    "source_sha256",
+    "source_type",
+    "type",
+}
 _CASE_REQUIRED_FILES = {
     "accounting.csv",
     "bootstrap_uncertainty.json",
@@ -591,6 +599,113 @@ def _verify_manifest_files(
     return declared_files, declared_hashes, case_files
 
 
+def _verify_replay_input(
+    root: Path,
+    schema_version: int,
+    manifest: Mapping[str, Any],
+    market_source: Mapping[str, Any],
+    declared_files: Sequence[str],
+    declared_hashes: Mapping[str, str],
+) -> bool:
+    if schema_version < 2:
+        if "replay_input" in manifest:
+            raise ExperimentArtifactError(
+                "manifest.replay_input requires artifact schema version 2"
+            )
+        return False
+
+    replay_input = _mapping(
+        manifest.get("replay_input"), "manifest.replay_input"
+    )
+    _exact_keys(replay_input, _REPLAY_INPUT_KEYS, "manifest.replay_input")
+    if replay_input["type"] != "embedded_market_snapshot":
+        raise ExperimentArtifactError(
+            "manifest.replay_input.type must be embedded_market_snapshot"
+        )
+    replay_path = _safe_relative_file(
+        replay_input["path"], "manifest.replay_input.path"
+    )
+    if replay_path != "market.snapshot.json":
+        raise ExperimentArtifactError(
+            "manifest.replay_input.path must be market.snapshot.json"
+        )
+    if replay_path not in declared_files:
+        raise ExperimentArtifactError(
+            "manifest.replay_input.path is absent from manifest.files"
+        )
+    replay_file_sha256 = _sha256(
+        replay_input["file_sha256"], "manifest.replay_input.file_sha256"
+    )
+    if declared_hashes.get(replay_path) != replay_file_sha256:
+        raise ExperimentArtifactError(
+            "manifest.replay_input.file_sha256 does not match file_sha256"
+        )
+    source_type = _nonempty_string(
+        market_source.get("type"), "manifest.market_source.type"
+    )
+    replay_source_type = _nonempty_string(
+        replay_input["source_type"], "manifest.replay_input.source_type"
+    )
+    if replay_source_type != source_type:
+        raise ExperimentArtifactError(
+            "manifest.replay_input.source_type does not match market_source"
+        )
+    source_sha256 = _sha256(
+        market_source.get("sha256"), "manifest.market_source.sha256"
+    )
+    replay_source_sha256 = _sha256(
+        replay_input["source_sha256"],
+        "manifest.replay_input.source_sha256",
+    )
+    if replay_source_sha256 != source_sha256:
+        raise ExperimentArtifactError(
+            "manifest.replay_input.source_sha256 does not match market_source"
+        )
+    _sha256(
+        replay_input["market_sha256"], "manifest.replay_input.market_sha256"
+    )
+
+    snapshot = _load_json_object(root / replay_path)
+    _exact_keys(snapshot, {"market", "metadata"}, replay_path)
+    metadata = _mapping(snapshot["metadata"], f"{replay_path}.metadata")
+    market = _mapping(snapshot["market"], f"{replay_path}.market")
+    metadata_type = metadata.get("type")
+    if metadata_type == "deterministic_synthetic_market":
+        if source_type != "deterministic_synthetic_market":
+            raise ExperimentArtifactError(
+                "synthetic replay metadata does not match market_source.type"
+            )
+    elif metadata_type == "frozen_experiment_market":
+        if metadata.get("source_type") != source_type:
+            raise ExperimentArtifactError(
+                "frozen replay metadata does not match market_source.type"
+            )
+        if metadata.get("source_authenticity_verified") is not False:
+            raise ExperimentArtifactError(
+                "frozen replay metadata cannot establish source authenticity"
+            )
+    else:
+        raise ExperimentArtifactError(
+            "market.snapshot.json has an unsupported metadata type"
+        )
+    if metadata.get("investment_validity") is not False:
+        raise ExperimentArtifactError(
+            "market.snapshot.json cannot establish investment validity"
+        )
+    if _canonical_sha256(market) != replay_input["market_sha256"]:
+        raise ExperimentArtifactError(
+            "manifest.replay_input.market_sha256 does not match the snapshot"
+        )
+    if (
+        source_type == "curated_dataset"
+        and "dataset.snapshot.json" not in declared_files
+    ):
+        raise ExperimentArtifactError(
+            "curated replay input requires dataset.snapshot.json lineage"
+        )
+    return True
+
+
 def _verify_case(
     root: Path,
     case_directory: str,
@@ -909,10 +1024,10 @@ def verify_experiment_artifacts(experiment_directory: Path) -> Dict[str, Any]:
     if (
         isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
-        or schema_version not in {0, 1}
+        or schema_version not in {0, 1, 2}
     ):
         raise ExperimentArtifactError(
-            "manifest.artifact_schema_version must be 1 or absent for v0.15"
+            "manifest.artifact_schema_version must be 1, 2, or absent for v0.15"
         )
     if manifest.get("research_only") is not True:
         raise ExperimentArtifactError("experiment manifest must be research-only")
@@ -966,6 +1081,14 @@ def verify_experiment_artifacts(experiment_directory: Path) -> Dict[str, Any]:
 
     declared_files, declared_hashes, case_files = _verify_manifest_files(
         root, manifest
+    )
+    replay_input_verified = _verify_replay_input(
+        root,
+        schema_version,
+        manifest,
+        market_source,
+        declared_files,
+        declared_hashes,
     )
     summary = _load_json_object(root / "summary.json")
     if summary.get("research_only") is not True:
@@ -1123,6 +1246,8 @@ def verify_experiment_artifacts(experiment_directory: Path) -> Dict[str, Any]:
         "bootstrap_enabled_test_case_count": len(enabled_test_cases),
         "file_hashes_verified": True,
         "cross_file_consistency_verified": True,
+        "replay_input_available": "market.snapshot.json" in declared_files,
+        "replay_input_verified": replay_input_verified,
         "replay_performed": False,
         "artifact_authenticity_verified": False,
         "investment_validity_established": False,

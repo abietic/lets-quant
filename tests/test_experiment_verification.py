@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import hashlib
 import io
 import json
@@ -92,8 +93,10 @@ class ExperimentArtifactVerificationTest(unittest.TestCase):
         report = verify_experiment_artifacts(self.run)
 
         self.assertEqual(report["status"], "pass")
-        self.assertEqual(report["artifact_schema_version"], 1)
+        self.assertEqual(report["artifact_schema_version"], 2)
         self.assertFalse(report["legacy_schema_inferred"])
+        self.assertTrue(report["replay_input_available"])
+        self.assertTrue(report["replay_input_verified"])
         self.assertEqual(report["case_count"], 9)
         self.assertEqual(report["test_case_count"], 3)
         self.assertEqual(report["bootstrap_enabled_test_case_count"], 3)
@@ -115,12 +118,50 @@ class ExperimentArtifactVerificationTest(unittest.TestCase):
     def test_v015_manifest_without_schema_remains_verifiable(self) -> None:
         manifest = self._manifest()
         del manifest["artifact_schema_version"]
+        del manifest["replay_input"]
         self._rewrite_manifest(manifest)
 
         report = verify_experiment_artifacts(self.run)
 
         self.assertEqual(report["artifact_schema_version"], 0)
         self.assertTrue(report["legacy_schema_inferred"])
+        self.assertFalse(report["replay_input_verified"])
+
+    def test_v017_schema_one_synthetic_artifact_remains_replayable(self) -> None:
+        manifest = self._manifest()
+        manifest["artifact_schema_version"] = 1
+        del manifest["replay_input"]
+        self._rewrite_manifest(manifest)
+
+        verification = verify_experiment_artifacts(self.run)
+        replay = replay_experiment_artifacts(self.run)
+
+        self.assertFalse(verification["replay_input_verified"])
+        self.assertEqual(replay["artifact_schema_version"], 1)
+        self.assertFalse(replay["portable_replay_input_verified"])
+        self.assertTrue(replay["replay_performed"])
+
+    def test_schema_version_and_replay_descriptor_cannot_be_mixed(self) -> None:
+        manifest = self._manifest()
+        manifest["artifact_schema_version"] = 1
+        self._rewrite_manifest(manifest)
+
+        with self.assertRaisesRegex(
+            ExperimentArtifactError,
+            "replay_input requires artifact schema version 2",
+        ):
+            verify_experiment_artifacts(self.run)
+
+    def test_schema_two_replay_market_hash_drift_is_rejected(self) -> None:
+        manifest = self._manifest()
+        manifest["replay_input"]["market_sha256"] = "0" * 64
+        self._rewrite_manifest(manifest)
+
+        with self.assertRaisesRegex(
+            ExperimentArtifactError,
+            "market_sha256 does not match the snapshot",
+        ):
+            verify_experiment_artifacts(self.run)
 
     def test_changed_file_fails_hash_verification(self) -> None:
         summary_path = self.run / "summary.json"
@@ -298,6 +339,16 @@ class ExperimentArtifactVerificationTest(unittest.TestCase):
             ).encode("utf-8")
         ).hexdigest()
         manifest["market_source"]["sha256"] = source_sha256
+        manifest["replay_input"]["file_sha256"] = file_sha256(snapshot_path)
+        manifest["replay_input"]["market_sha256"] = hashlib.sha256(
+            json.dumps(
+                snapshot["market"],
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        manifest["replay_input"]["source_sha256"] = source_sha256
         manifest["experiment_id"] = hashlib.sha256(
             (
                 manifest["experiment_input_id"]
@@ -316,10 +367,14 @@ class ExperimentArtifactVerificationTest(unittest.TestCase):
         ):
             replay_experiment_artifacts(self.run)
 
-    def test_external_market_source_remains_verify_only(self) -> None:
+    def test_legacy_artifact_without_embedded_market_remains_verify_only(
+        self,
+    ) -> None:
         snapshot_path = self.run / "market.snapshot.json"
         snapshot_path.unlink()
         manifest = self._manifest()
+        manifest["artifact_schema_version"] = 1
+        del manifest["replay_input"]
         manifest["files"].remove("market.snapshot.json")
         del manifest["file_sha256"]["market.snapshot.json"]
         self._rewrite_manifest(manifest)
@@ -330,6 +385,100 @@ class ExperimentArtifactVerificationTest(unittest.TestCase):
             "requires an embedded market.snapshot.json",
         ):
             replay_experiment_artifacts(self.run)
+
+    def test_standalone_csv_is_frozen_and_portably_replayed(self) -> None:
+        source_snapshot = json.loads(
+            (self._base_run / "market.snapshot.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            prices_path = temporary / "prices.csv"
+            with prices_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=["date", "symbol", "close"]
+                )
+                writer.writeheader()
+                for trading_date in source_snapshot["market"]["dates"]:
+                    for symbol, close in sorted(
+                        source_snapshot["market"]["prices"][
+                            trading_date
+                        ].items()
+                    ):
+                        writer.writerow(
+                            {
+                                "date": trading_date,
+                                "symbol": symbol,
+                                "close": close,
+                            }
+                        )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "run-experiment",
+                        "--policy",
+                        str(ROOT / "config/policy.momentum.example.json"),
+                        "--experiment",
+                        str(ROOT / "config/experiment.m1_5.example.json"),
+                        "--prices",
+                        str(prices_path),
+                        "--output-root",
+                        str(temporary / "experiments"),
+                    ]
+                )
+            self.assertEqual(exit_code, 0, stdout.getvalue())
+            experiment_directory = Path(
+                json.loads(stdout.getvalue())["artifact_directory"]
+            )
+            manifest = json.loads(
+                (experiment_directory / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            snapshot = json.loads(
+                (experiment_directory / "market.snapshot.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertEqual(manifest["artifact_schema_version"], 2)
+            self.assertEqual(
+                manifest["replay_input"]["source_type"],
+                "standalone_prices_csv",
+            )
+            self.assertEqual(
+                snapshot["metadata"]["type"], "frozen_experiment_market"
+            )
+            self.assertFalse(
+                snapshot["metadata"]["source_authenticity_verified"]
+            )
+
+            prices_path.unlink()
+            report = replay_experiment_artifacts(experiment_directory)
+            self.assertEqual(
+                report["market_source_type"], "standalone_prices_csv"
+            )
+            self.assertTrue(report["portable_replay_input_verified"])
+            self.assertTrue(report["replay_performed"])
+
+            snapshot["metadata"]["source_authenticity_verified"] = True
+            snapshot_path = experiment_directory / "market.snapshot.json"
+            _write_json(snapshot_path, snapshot)
+            manifest["file_sha256"]["market.snapshot.json"] = file_sha256(
+                snapshot_path
+            )
+            manifest["replay_input"]["file_sha256"] = file_sha256(
+                snapshot_path
+            )
+            _write_json(experiment_directory / "manifest.json", manifest)
+            with self.assertRaisesRegex(
+                ExperimentArtifactError,
+                "cannot establish source authenticity",
+            ):
+                verify_experiment_artifacts(experiment_directory)
 
     def test_embedded_market_with_corporate_action_is_reversible(self) -> None:
         dates = [date(2025, 1, 2), date(2025, 1, 3)]

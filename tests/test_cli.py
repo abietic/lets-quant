@@ -3,6 +3,7 @@ import csv
 import hashlib
 import io
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -249,6 +250,91 @@ class CliTest(unittest.TestCase):
             self.assertTrue(metrics["accounting_reconciled"])
             self.assertEqual(metrics["corporate_action_entry_count"], 1)
 
+            experiment_path = temporary / "experiment.json"
+            experiment_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "name": "curated-dataset-replay",
+                        "seed": 20260824,
+                        "windows": [
+                            {
+                                "name": "train",
+                                "role": "train",
+                                "start": "2025-01-02",
+                                "end": "2025-01-02",
+                            },
+                            {
+                                "name": "validation",
+                                "role": "validation",
+                                "start": "2025-01-03",
+                                "end": "2025-01-03",
+                            },
+                            {
+                                "name": "test",
+                                "role": "test",
+                                "start": "2025-01-06",
+                                "end": "2025-01-08",
+                            },
+                        ],
+                        "execution_scenarios": [
+                            {"name": "configured-costs"}
+                        ],
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                experiment_exit = main(
+                    [
+                        "run-experiment",
+                        "--policy",
+                        str(ROOT / "config/policy.cn-etf.example.json"),
+                        "--experiment",
+                        str(experiment_path),
+                        "--dataset",
+                        curated_payload["dataset_directory"],
+                        "--output-root",
+                        str(temporary / "experiments"),
+                    ]
+                )
+            self.assertEqual(experiment_exit, 0, stdout.getvalue())
+            experiment_directory = Path(
+                json.loads(stdout.getvalue())["artifact_directory"]
+            )
+            experiment_manifest = json.loads(
+                (experiment_directory / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                experiment_manifest["replay_input"]["source_type"],
+                "curated_dataset",
+            )
+            self.assertTrue(
+                (experiment_directory / "dataset.snapshot.json").exists()
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                replay_exit = main(
+                    [
+                        "replay-experiment",
+                        "--experiment-run",
+                        str(experiment_directory),
+                    ]
+                )
+            replay_payload = json.loads(stdout.getvalue())
+            self.assertEqual(replay_exit, 0, stdout.getvalue())
+            self.assertEqual(
+                replay_payload["market_source_type"], "curated_dataset"
+            )
+            self.assertTrue(replay_payload["portable_replay_input_verified"])
+            self.assertTrue(replay_payload["replay_performed"])
+
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
                 plan_exit = main(
@@ -266,6 +352,21 @@ class CliTest(unittest.TestCase):
                 )
             self.assertEqual(plan_exit, 2)
             self.assertIn("unadjusted", stderr.getvalue())
+
+            shutil.rmtree(Path(curated_payload["dataset_directory"]))
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                portable_replay_exit = main(
+                    [
+                        "replay-experiment",
+                        "--experiment-run",
+                        str(experiment_directory),
+                    ]
+                )
+            portable_replay = json.loads(stdout.getvalue())
+            self.assertEqual(portable_replay_exit, 0, stdout.getvalue())
+            self.assertTrue(portable_replay["replay_performed"])
+            self.assertTrue(portable_replay["portable_replay_input_verified"])
 
     def test_offline_experiment_writes_replayable_case_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

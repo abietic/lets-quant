@@ -629,6 +629,18 @@ def _run_experiment(args: argparse.Namespace) -> int:
             "market": market_identity(market),
         }
 
+    if market_snapshot is None:
+        market_snapshot = {
+            "metadata": {
+                "type": "frozen_experiment_market",
+                "source_type": market_source["type"],
+                "source_authenticity_verified": False,
+                "investment_validity": False,
+                "purpose": "offline behavioral replay only",
+            },
+            "market": market_identity(market),
+        }
+
     result = run_experiment(spec, policy, market)
     destination = write_experiment_artifacts(
         result,

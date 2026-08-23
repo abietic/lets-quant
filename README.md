@@ -22,7 +22,8 @@
 - 基于前一交易日基准历史的冻结市场阶段标签、逐日证据和对数收益归因。
 - 仅用于 test 窗口的确定性移动块 bootstrap 收益区间，策略与基准配对重采样。
 - 对实验目录执行路径安全、逐文件哈希、case 身份、摘要绑定和 CSV 日期轴验证。
-- 对自包含合成实验重建冻结市场并重跑，逐位核对输入 ID、结果哈希和 summary。
+- 为合成、CSV 和清洗数据集实验冻结规范市场输入并重跑，逐位核对输入 ID、结果
+  哈希和 summary。
 - 带严格输入指纹和差异报告的跨引擎候选产物契约与对账器。
 - 可选 VectorBT 1.1.0 适配器，消费独立 CSV 或清洗数据集，复核停牌拒绝、成交、
   企业行动回调、费用、持仓和 NAV。
@@ -174,21 +175,22 @@ train、validation、test 窗口，可以定义多组佣金、税费、滑点和
 - `cases/` 保存每个案例的指标、净值、决策证据、成交记录、逐日
   `regime_attribution.csv` 和 `bootstrap_uncertainty.json`。
 
-新实验 manifest 使用 artifact schema v1。可以独立验证现有目录：
+新实验 manifest 使用 artifact schema v2，以独立 `replay_input` 同时绑定规范市场
+文件、市场身份和原始来源 lineage。可以独立验证现有目录：
 
 ```bash
 PYTHONPATH=src python3 -m lets_quant verify-experiment \
   --experiment-run artifacts/experiments/<run-id>
 ```
 
-验证器拒绝路径穿越、符号链接、缺失/额外文件、哈希漂移，以及 case snapshot、
-bootstrap、metrics、CSV 日期轴和根摘要之间的矛盾；v0.15 生成的无 schema manifest
-会以 legacy schema 读取。成功报告中的 `file_hashes_verified` 和
+验证器拒绝路径穿越、符号链接、缺失/额外文件、哈希漂移，以及 replay input、
+case snapshot、bootstrap、metrics、CSV 日期轴和根摘要之间的矛盾；v0.15 生成的
+无 schema manifest 会以 legacy schema 读取。成功报告中的 `file_hashes_verified` 和
 `cross_file_consistency_verified` 为 `true`，但 `replay_performed` 与
 `artifact_authenticity_verified` 仍为 `false`。完整边界见
 [实验产物验证](docs/EXPERIMENT_VERIFICATION.md)。
 
-带 `market.snapshot.json` 的确定性合成实验还可以实际重放：
+带 `market.snapshot.json` 的实验还可以实际重放：
 
 ```bash
 PYTHONPATH=src python3 -m lets_quant replay-experiment \
@@ -196,9 +198,11 @@ PYTHONPATH=src python3 -m lets_quant replay-experiment \
 ```
 
 重放先执行完整性验证，再重建冻结市场、重新运行全部 case，并逐位核对
-`experiment_input_id`、`result_sha256` 和 `summary.json`。命令要求当前 Python
-完整版本与 manifest 一致；外部 CSV/数据集暂时保持 verify-only。完整契约见
-[实验离线重放](docs/EXPERIMENT_REPLAY.md)。
+`experiment_input_id`、`result_sha256` 和 `summary.json`。schema v2 会为合成场景、
+独立 CSV 和清洗数据集统一保存实际进入研究内核的规范市场；原文件或数据集目录
+移动后仍可重放。命令要求当前 Python 完整版本与 manifest 一致。完整契约见
+[实验离线重放](docs/EXPERIMENT_REPLAY.md)。这只证明冻结输入的行为可复现，不证明
+原始来源真实或投资结论有效。
 
 相同策略、实验定义、市场、源码和完整 Python 版本应产生相同输入 ID 与结果哈希。
 目录时间戳可以不同；跨运行时比较必须读取 manifest 的 Python 版本，不能把末位

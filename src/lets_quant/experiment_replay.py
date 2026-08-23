@@ -13,6 +13,7 @@ from .config import load_policy
 from .experiment_verification import verify_experiment_artifacts
 from .experiments import load_experiment_spec, market_identity, run_experiment
 from .models import CorporateAction, MarketData
+from .snapshots import file_sha256
 
 
 class ExperimentReplayError(ValueError):
@@ -194,14 +195,26 @@ def load_embedded_market_snapshot(path: Path) -> MarketData:
     snapshot = _load_json_object(path)
     _exact_keys(snapshot, {"market", "metadata"}, str(path))
     metadata = _mapping(snapshot["metadata"], f"{path}.metadata")
-    if metadata.get("type") != "deterministic_synthetic_market":
+    metadata_type = metadata.get("type")
+    if metadata_type not in {
+        "deterministic_synthetic_market",
+        "frozen_experiment_market",
+    }:
         raise ExperimentReplayError(
-            "embedded replay currently supports deterministic synthetic markets only"
+            "embedded market snapshot has an unsupported metadata type"
         )
     if metadata.get("investment_validity") is not False:
         raise ExperimentReplayError(
-            "embedded synthetic market cannot establish investment validity"
+            "embedded market snapshot cannot establish investment validity"
         )
+    if metadata_type == "frozen_experiment_market":
+        _nonempty_string(
+            metadata.get("source_type"), f"{path}.metadata.source_type"
+        )
+        if metadata.get("source_authenticity_verified") is not False:
+            raise ExperimentReplayError(
+                "frozen market snapshot cannot establish source authenticity"
+            )
     market = _mapping(snapshot["market"], f"{path}.market")
     _exact_keys(market, _MARKET_KEYS, f"{path}.market")
 
@@ -355,24 +368,72 @@ def replay_experiment_artifacts(experiment_directory: Path) -> Dict[str, Any]:
     if not market_snapshot_path.is_file():
         raise ExperimentReplayError(
             "experiment replay requires an embedded market.snapshot.json; "
-            "external prices and datasets remain verify-only"
+            "legacy artifacts without one remain verify-only"
         )
     market_snapshot = _load_json_object(market_snapshot_path)
     market_source = _mapping(
         manifest.get("market_source"), "manifest.market_source"
     )
-    source_sha256 = hashlib.sha256(
-        json.dumps(
-            market_snapshot,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("utf-8")
-    ).hexdigest()
-    if market_source.get("sha256") != source_sha256:
+    schema_version = integrity["artifact_schema_version"]
+    market_source_type = _nonempty_string(
+        market_source.get("type"), "manifest.market_source.type"
+    )
+    snapshot_metadata = _mapping(
+        market_snapshot.get("metadata"), "market.snapshot.json.metadata"
+    )
+    if (
+        snapshot_metadata.get("type") == "frozen_experiment_market"
+        and snapshot_metadata.get("source_type") != market_source_type
+    ):
         raise ExperimentReplayError(
-            "embedded market snapshot does not match manifest.market_source"
+            "embedded market snapshot metadata changed after verification"
         )
+    if schema_version >= 2:
+        replay_input = _mapping(
+            manifest.get("replay_input"), "manifest.replay_input"
+        )
+        if replay_input.get("file_sha256") != file_sha256(
+            market_snapshot_path
+        ):
+            raise ExperimentReplayError(
+                "embedded market snapshot file changed after integrity verification"
+            )
+        market_payload = _mapping(
+            market_snapshot.get("market"), "market.snapshot.json.market"
+        )
+        market_sha256 = hashlib.sha256(
+            json.dumps(
+                market_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if replay_input.get("market_sha256") != market_sha256:
+            raise ExperimentReplayError(
+                "embedded market snapshot identity changed after verification"
+            )
+        if (
+            replay_input.get("source_type") != market_source_type
+            or replay_input.get("source_sha256")
+            != market_source.get("sha256")
+        ):
+            raise ExperimentReplayError(
+                "embedded market snapshot lineage changed after verification"
+            )
+    else:
+        source_sha256 = hashlib.sha256(
+            json.dumps(
+                market_snapshot,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if market_source.get("sha256") != source_sha256:
+            raise ExperimentReplayError(
+                "legacy embedded market snapshot does not match market_source"
+            )
 
     market = load_embedded_market_snapshot(market_snapshot_path)
     policy = load_policy(root / "policy.snapshot.json")
@@ -398,6 +459,7 @@ def replay_experiment_artifacts(experiment_directory: Path) -> Dict[str, Any]:
     return {
         "status": "pass",
         "artifact_type": "research_experiment_replay",
+        "artifact_schema_version": schema_version,
         "experiment_directory": str(root),
         "experiment_id": manifest["experiment_id"],
         "experiment_input_id": replayed.experiment_input_id,
@@ -406,6 +468,8 @@ def replay_experiment_artifacts(experiment_directory: Path) -> Dict[str, Any]:
         "replay_tool_version": __version__,
         "python_version": actual_python,
         "python_version_match": True,
+        "market_source_type": market_source_type,
+        "portable_replay_input_verified": integrity["replay_input_verified"],
         "integrity_verified_before_replay": True,
         "embedded_market_snapshot_verified": True,
         "experiment_input_id_match": True,
