@@ -12,34 +12,72 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
-  test:
+  core:
+    name: Core / Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.11", "3.13"]
+        python-version:
+          - "3.9"
+          - "3.11"
+          - "3.14"
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: pyproject.toml
-      - name: Install package
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e '.[dev]'
-      - name: Run lint checks
-        run: make lint
-      - name: Run compile and unit tests
-        run: make check
-      - name: Verify installed CLI
-        run: lets-quant --help
+      - name: Install project and lint tooling
+        run: python -m pip install -e ".[dev]"
+      - name: Run offline core verification
+        run: make ci PYTHON=python
       - name: Run offline acceptance demos
         if: matrix.python-version == '3.11'
         run: >-
-          make validate m1-validate m1-demo m15-demo m2-demo paper-demo
-          paper-audit-demo
+          make validate m1-validate m1-demo m15-demo m2-demo
+          experiment-verify-demo experiment-replay-demo experiment-compare-demo
+          paper-demo paper-audit-demo PYTHON=python
+
+  package:
+    name: Package / Python 3.14
+    needs: core
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Build distributions
+        run: |
+          python -m pip install build==1.5.0
+          python -m build
+      - name: Install wheel
+        run: |
+          test "$(find dist -maxdepth 1 -name '*.whl' | wc -l | tr -d ' ')" = "1"
+          python -m pip install --force-reinstall dist/*.whl
+          python -m pip check
+      - name: Smoke test installed package
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c 'from importlib.metadata import version; from pathlib import Path; import lets_quant; assert lets_quant.__version__ == version("lets-quant"); assert "site-packages" in Path(lets_quant.__file__).resolve().parts'
+          lets-quant --help
+          lets-quant validate-policy --policy "$GITHUB_WORKSPACE/config/policy.example.json"

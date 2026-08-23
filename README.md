@@ -1,5 +1,7 @@
 # lets-quant
 
+[![CI](https://github.com/abietic/lets-quant/actions/workflows/ci.yml/badge.svg)](https://github.com/abietic/lets-quant/actions/workflows/ci.yml)
+
 `lets-quant` 是一个本地优先、研究用途的个人量化投资工具。它当前解决的
 不是“自动赚钱”，而是把投资规则变成可验证、可复现、可审计的决策流程。
 
@@ -46,6 +48,7 @@
 项目仅依赖 Python 3.9+ 标准库。
 
 ```bash
+make ci
 make check
 make validate
 make demo
@@ -473,6 +476,7 @@ AKShare 的 MIT 许可是代码许可，不等于其上游行情的再分发或�
 
 - [架构和安全不变量](docs/ARCHITECTURE.md)
 - [分阶段路线图](docs/ROADMAP.md)
+- [仓库与发布运维](docs/REPOSITORY_OPERATIONS.md)
 - [M1 数据管道](docs/DATA_PIPELINE.md)
 - [Bootstrap 不确定性](docs/BOOTSTRAP_UNCERTAINTY.md)
 - [实验产物验证](docs/EXPERIMENT_VERIFICATION.md)
