@@ -21,6 +21,7 @@
 - 多个滚动时间折和邻近策略参数敏感性矩阵，不自动选择最优参数。
 - 基于前一交易日基准历史的冻结市场阶段标签、逐日证据和对数收益归因。
 - 仅用于 test 窗口的确定性移动块 bootstrap 收益区间，策略与基准配对重采样。
+- 对实验目录执行路径安全、逐文件哈希、case 身份、摘要绑定和 CSV 日期轴验证。
 - 带严格输入指纹和差异报告的跨引擎候选产物契约与对账器。
 - 可选 VectorBT 1.1.0 适配器，消费独立 CSV 或清洗数据集，复核停牌拒绝、成交、
   企业行动回调、费用、持仓和 NAV。
@@ -49,6 +50,7 @@ make m1-validate
 make m1-demo
 make m15-demo
 make m2-demo
+make experiment-verify-demo
 make paper-demo
 make paper-audit-demo
 ```
@@ -169,6 +171,20 @@ train、validation、test 窗口，可以定义多组佣金、税费、滑点和
   证明。
 - `cases/` 保存每个案例的指标、净值、决策证据、成交记录、逐日
   `regime_attribution.csv` 和 `bootstrap_uncertainty.json`。
+
+新实验 manifest 使用 artifact schema v1。可以独立验证现有目录：
+
+```bash
+PYTHONPATH=src python3 -m lets_quant verify-experiment \
+  --experiment-run artifacts/experiments/<run-id>
+```
+
+验证器拒绝路径穿越、符号链接、缺失/额外文件、哈希漂移，以及 case snapshot、
+bootstrap、metrics、CSV 日期轴和根摘要之间的矛盾；v0.15 生成的无 schema manifest
+会以 legacy schema 读取。成功报告中的 `file_hashes_verified` 和
+`cross_file_consistency_verified` 为 `true`，但 `replay_performed` 与
+`artifact_authenticity_verified` 仍为 `false`。完整边界见
+[实验产物验证](docs/EXPERIMENT_VERIFICATION.md)。
 
 相同策略、实验定义、市场、源码和 Python 次版本应产生相同
 `experiment_input_id` 与 `result_sha256`。目录时间戳可以不同，这两个摘要才是
@@ -423,6 +439,7 @@ AKShare 的 MIT 许可是代码许可，不等于其上游行情的再分发或�
 - [分阶段路线图](docs/ROADMAP.md)
 - [M1 数据管道](docs/DATA_PIPELINE.md)
 - [Bootstrap 不确定性](docs/BOOTSTRAP_UNCERTAINTY.md)
+- [实验产物验证](docs/EXPERIMENT_VERIFICATION.md)
 - [跨引擎验证](docs/CROSS_ENGINE_VALIDATION.md)
 - [离线 Paper 运营审计](docs/PAPER_OPERATIONS.md)
 

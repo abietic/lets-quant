@@ -38,6 +38,7 @@ from .experiments import (
     market_identity,
     run_experiment,
 )
+from .experiment_verification import verify_experiment_artifacts
 from .execution import (
     PaperAuditError,
     PaperExchange,
@@ -184,6 +185,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     experiment.add_argument(
         "--output-root", type=Path, default=Path("artifacts/experiments")
+    )
+
+    verify_experiment = subcommands.add_parser(
+        "verify-experiment",
+        help="verify experiment file hashes and cross-file consistency",
+    )
+    verify_experiment.add_argument(
+        "--experiment-run", type=Path, required=True
     )
 
     plan = subcommands.add_parser(
@@ -639,6 +648,12 @@ def _run_experiment(args: argparse.Namespace) -> int:
     return 0
 
 
+def _verify_experiment(args: argparse.Namespace) -> int:
+    report = verify_experiment_artifacts(args.experiment_run)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
 def _plan_orders(args: argparse.Namespace) -> int:
     policy = load_policy(args.policy)
     market, prices_path, dataset_manifest, _, _ = _load_market_source(
@@ -856,6 +871,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _backtest(args)
         if args.command == "run-experiment":
             return _run_experiment(args)
+        if args.command == "verify-experiment":
+            return _verify_experiment(args)
         if args.command == "plan-orders":
             return _plan_orders(args)
         if args.command == "replay-paper-events":

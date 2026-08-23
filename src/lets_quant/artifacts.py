@@ -631,7 +631,7 @@ def write_experiment_artifacts(
         _write_backtest_result_files(case_directory, case.result)
 
     artifact_files = sorted(
-        str(path.relative_to(destination))
+        path.relative_to(destination).as_posix()
         for path in destination.rglob("*")
         if path.is_file()
     )
@@ -647,6 +647,7 @@ def write_experiment_artifacts(
         destination / "manifest.json",
         {
             "artifact_type": "research_experiment",
+            "artifact_schema_version": 1,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "experiment_id": experiment_id,
             "experiment_input_id": result.experiment_input_id,
