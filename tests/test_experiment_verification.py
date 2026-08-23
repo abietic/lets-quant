@@ -1,9 +1,11 @@
 import contextlib
+import hashlib
 import io
 import json
 import shutil
 import tempfile
 import unittest
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from lets_quant.cli import main
@@ -11,6 +13,13 @@ from lets_quant.experiment_verification import (
     ExperimentArtifactError,
     verify_experiment_artifacts,
 )
+from lets_quant.experiment_replay import (
+    ExperimentReplayError,
+    load_embedded_market_snapshot,
+    replay_experiment_artifacts,
+)
+from lets_quant.experiments import market_identity
+from lets_quant.models import CorporateAction, MarketData
 from lets_quant.snapshots import file_sha256
 
 
@@ -216,6 +225,146 @@ class ExperimentArtifactVerificationTest(unittest.TestCase):
             "metric total_return does not match",
         ):
             verify_experiment_artifacts(self.run)
+
+    def test_self_contained_experiment_replays_through_cli(self) -> None:
+        report = replay_experiment_artifacts(self.run)
+
+        self.assertEqual(report["status"], "pass")
+        self.assertTrue(report["replay_performed"])
+        self.assertTrue(report["python_version_match"])
+        self.assertTrue(report["experiment_input_id_match"])
+        self.assertTrue(report["result_sha256_match"])
+        self.assertTrue(report["summary_match"])
+        self.assertEqual(report["replayed_case_count"], 9)
+        self.assertFalse(report["artifact_authenticity_verified"])
+        self.assertFalse(report["investment_validity_established"])
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            exit_code = main(
+                ["replay-experiment", "--experiment-run", str(self.run)]
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(json.loads(stdout.getvalue())["replay_performed"])
+
+    def test_replay_requires_exact_recorded_python_version(self) -> None:
+        manifest = self._manifest()
+        manifest["python_version"] = "0.0.0"
+        self._rewrite_manifest(manifest)
+
+        with self.assertRaisesRegex(
+            ExperimentReplayError,
+            "requires the recorded Python version",
+        ):
+            replay_experiment_artifacts(self.run)
+
+    def test_coordinated_result_hash_drift_is_caught_by_replay(self) -> None:
+        manifest = self._manifest()
+        changed_result_hash = "0" * 64
+        manifest["result_sha256"] = changed_result_hash
+        for case_directory in (self.run / "cases").iterdir():
+            snapshot_path = case_directory / "case.snapshot.json"
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            snapshot["experiment_result_sha256"] = changed_result_hash
+            _write_json(snapshot_path, snapshot)
+            relative_path = snapshot_path.relative_to(self.run).as_posix()
+            manifest["file_sha256"][relative_path] = file_sha256(snapshot_path)
+        self._rewrite_manifest(manifest)
+        self.assertEqual(verify_experiment_artifacts(self.run)["status"], "pass")
+
+        with self.assertRaisesRegex(
+            ExperimentReplayError,
+            "replayed result_sha256 differs",
+        ):
+            replay_experiment_artifacts(self.run)
+
+    def test_coordinated_market_drift_changes_replayed_input_id(self) -> None:
+        snapshot_path = self.run / "market.snapshot.json"
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        first_date = snapshot["market"]["dates"][0]
+        first_symbol = sorted(snapshot["market"]["prices"][first_date])[0]
+        snapshot["market"]["prices"][first_date][first_symbol] += 1.0
+        _write_json(snapshot_path, snapshot)
+
+        manifest = self._manifest()
+        relative_path = snapshot_path.relative_to(self.run).as_posix()
+        manifest["file_sha256"][relative_path] = file_sha256(snapshot_path)
+        source_sha256 = hashlib.sha256(
+            json.dumps(
+                snapshot,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        manifest["market_source"]["sha256"] = source_sha256
+        manifest["experiment_id"] = hashlib.sha256(
+            (
+                manifest["experiment_input_id"]
+                + manifest["source_tree_sha256"]
+                + manifest["policy_sha256"]
+                + manifest["experiment_sha256"]
+                + source_sha256
+            ).encode("utf-8")
+        ).hexdigest()
+        self._rewrite_manifest(manifest)
+        self.assertEqual(verify_experiment_artifacts(self.run)["status"], "pass")
+
+        with self.assertRaisesRegex(
+            ExperimentReplayError,
+            "replayed experiment_input_id differs",
+        ):
+            replay_experiment_artifacts(self.run)
+
+    def test_external_market_source_remains_verify_only(self) -> None:
+        snapshot_path = self.run / "market.snapshot.json"
+        snapshot_path.unlink()
+        manifest = self._manifest()
+        manifest["files"].remove("market.snapshot.json")
+        del manifest["file_sha256"]["market.snapshot.json"]
+        self._rewrite_manifest(manifest)
+        self.assertEqual(verify_experiment_artifacts(self.run)["status"], "pass")
+
+        with self.assertRaisesRegex(
+            ExperimentReplayError,
+            "requires an embedded market.snapshot.json",
+        ):
+            replay_experiment_artifacts(self.run)
+
+    def test_embedded_market_with_corporate_action_is_reversible(self) -> None:
+        dates = [date(2025, 1, 2), date(2025, 1, 3)]
+        action = CorporateAction(
+            symbol="ASSET_A",
+            event_type="cash_dividend",
+            ex_date=dates[1],
+            announced_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            cash_amount=0.2,
+            available_at=datetime(2025, 1, 1, 8, tzinfo=timezone.utc),
+        )
+        market = MarketData(
+            dates=dates,
+            prices_by_date={
+                dates[0]: {"ASSET_A": 10.0},
+                dates[1]: {"ASSET_A": 9.8},
+            },
+            tradable_by_date={value: {"ASSET_A"} for value in dates},
+            corporate_actions_by_date={dates[1]: [action]},
+        )
+        snapshot_path = Path(self._temp.name) / "embedded-market.json"
+        _write_json(
+            snapshot_path,
+            {
+                "metadata": {
+                    "type": "deterministic_synthetic_market",
+                    "investment_validity": False,
+                },
+                "market": market_identity(market),
+            },
+        )
+
+        reconstructed = load_embedded_market_snapshot(snapshot_path)
+
+        self.assertEqual(market_identity(reconstructed), market_identity(market))
 
 
 if __name__ == "__main__":

@@ -65,8 +65,9 @@ make experiment-verify-demo
 - **真实性**：manifest 是否由可信主体产生。当前没有外部签名或透明日志，因此
   验证器不会声明真实性；攻击者若能同时改写全部文件和 manifest，单靠目录内部
   哈希无法识别。
-- **重放性**：使用原始输入和源码重新执行后是否得到相同结果。当前命令不重跑，
-  只返回 `replay_performed=false`；重放还需要匹配 manifest 的源码与 Python 版本。
+- **重放性**：使用冻结输入重新执行后是否得到相同结果。当前命令不重跑，只返回
+  `replay_performed=false`；带内嵌合成市场且完整 Python 版本一致的目录可继续使用
+  [`replay-experiment`](EXPERIMENT_REPLAY.md)。
 - **投资有效性**：完整产物不等于有效策略，验证结果不能改变
   `investment_validity_established=false`。
 

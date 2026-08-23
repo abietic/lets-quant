@@ -22,6 +22,7 @@
 - 基于前一交易日基准历史的冻结市场阶段标签、逐日证据和对数收益归因。
 - 仅用于 test 窗口的确定性移动块 bootstrap 收益区间，策略与基准配对重采样。
 - 对实验目录执行路径安全、逐文件哈希、case 身份、摘要绑定和 CSV 日期轴验证。
+- 对自包含合成实验重建冻结市场并重跑，逐位核对输入 ID、结果哈希和 summary。
 - 带严格输入指纹和差异报告的跨引擎候选产物契约与对账器。
 - 可选 VectorBT 1.1.0 适配器，消费独立 CSV 或清洗数据集，复核停牌拒绝、成交、
   企业行动回调、费用、持仓和 NAV。
@@ -51,6 +52,7 @@ make m1-demo
 make m15-demo
 make m2-demo
 make experiment-verify-demo
+make experiment-replay-demo
 make paper-demo
 make paper-audit-demo
 ```
@@ -186,9 +188,21 @@ bootstrap、metrics、CSV 日期轴和根摘要之间的矛盾；v0.15 生成的
 `artifact_authenticity_verified` 仍为 `false`。完整边界见
 [实验产物验证](docs/EXPERIMENT_VERIFICATION.md)。
 
-相同策略、实验定义、市场、源码和 Python 次版本应产生相同
-`experiment_input_id` 与 `result_sha256`。目录时间戳可以不同，这两个摘要才是
-同运行时重放的核对依据；跨 Python 次版本比较还应读取 manifest 中的运行时版本。
+带 `market.snapshot.json` 的确定性合成实验还可以实际重放：
+
+```bash
+PYTHONPATH=src python3 -m lets_quant replay-experiment \
+  --experiment-run artifacts/experiments/<run-id>
+```
+
+重放先执行完整性验证，再重建冻结市场、重新运行全部 case，并逐位核对
+`experiment_input_id`、`result_sha256` 和 `summary.json`。命令要求当前 Python
+完整版本与 manifest 一致；外部 CSV/数据集暂时保持 verify-only。完整契约见
+[实验离线重放](docs/EXPERIMENT_REPLAY.md)。
+
+相同策略、实验定义、市场、源码和完整 Python 版本应产生相同输入 ID 与结果哈希。
+目录时间戳可以不同；跨运行时比较必须读取 manifest 的 Python 版本，不能把末位
+浮点差异误报成同环境重放失败。
 
 ## M2 参数稳定性实验
 
@@ -440,6 +454,7 @@ AKShare 的 MIT 许可是代码许可，不等于其上游行情的再分发或�
 - [M1 数据管道](docs/DATA_PIPELINE.md)
 - [Bootstrap 不确定性](docs/BOOTSTRAP_UNCERTAINTY.md)
 - [实验产物验证](docs/EXPERIMENT_VERIFICATION.md)
+- [实验离线重放](docs/EXPERIMENT_REPLAY.md)
 - [跨引擎验证](docs/CROSS_ENGINE_VALIDATION.md)
 - [离线 Paper 运营审计](docs/PAPER_OPERATIONS.md)
 
