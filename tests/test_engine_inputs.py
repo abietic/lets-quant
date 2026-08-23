@@ -71,6 +71,13 @@ class EngineInputsTest(unittest.TestCase):
             self.assertEqual(bar.volume, 118000)
             self.assertFalse(bar.tradable)
             self.assertIsNotNone(market_input.dataset_snapshot_sha256)
+            instrument = market_input.instruments["510300.XSHG"]
+            self.assertEqual(instrument.exchange, "XSHG")
+            self.assertEqual(instrument.asset_type, "ETF")
+            self.assertEqual(
+                market_input.instrument_master_source, "curated_dataset"
+            )
+            self.assertEqual(len(market_input.instrument_master_sha256), 64)
 
             with self.assertRaisesRegex(
                 EngineValidationError, "pass --dataset"

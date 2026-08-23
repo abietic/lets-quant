@@ -65,6 +65,16 @@ class CorporateAction:
 
 
 @dataclass(frozen=True)
+class InstrumentMetadata:
+    symbol: str
+    exchange: str
+    asset_type: str
+    listed_on: date
+    delisted_on: Optional[date]
+    available_at: Optional[datetime]
+
+
+@dataclass(frozen=True)
 class MarketData:
     dates: List[date]
     prices_by_date: Dict[date, Dict[str, float]]

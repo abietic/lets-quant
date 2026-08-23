@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 from .experiments import ExperimentResult
-from .models import BacktestResult, Holding, ManualOrderPlan, Policy
+from .models import (
+    BacktestResult,
+    Holding,
+    InstrumentMetadata,
+    ManualOrderPlan,
+    Policy,
+)
 
 
 def _file_sha256(path: Path) -> str:
@@ -303,9 +309,55 @@ def write_backtest_artifacts(
     initial_holdings: Sequence[Holding] = (),
     initial_holdings_path: Optional[Path] = None,
     dataset_manifest: Optional[Mapping[str, Any]] = None,
+    instrument_master: Sequence[InstrumentMetadata] = (),
+    instrument_master_source: str = "",
 ) -> Path:
     policy_hash = _file_sha256(policy_path)
     prices_hash = _file_sha256(prices_path)
+    if not instrument_master_source.strip():
+        raise ValueError("instrument_master_source must not be empty")
+    normalized_instruments = [
+        {
+            "symbol": instrument.symbol.strip().upper(),
+            "exchange": instrument.exchange.strip().upper(),
+            "asset_type": instrument.asset_type.strip().upper(),
+            "listed_on": instrument.listed_on.isoformat(),
+            "delisted_on": (
+                instrument.delisted_on.isoformat()
+                if instrument.delisted_on is not None
+                else ""
+            ),
+            "available_at": (
+                instrument.available_at.isoformat()
+                if instrument.available_at is not None
+                else ""
+            ),
+        }
+        for instrument in sorted(
+            instrument_master, key=lambda item: item.symbol.strip().upper()
+        )
+    ]
+    instrument_symbols = [item["symbol"] for item in normalized_instruments]
+    if len(set(instrument_symbols)) != len(instrument_symbols):
+        raise ValueError("instrument master symbols must be unique")
+    required_instruments = set(policy.strategy.target_weights)
+    if policy.portfolio.benchmark:
+        required_instruments.add(policy.portfolio.benchmark)
+    missing_instruments = sorted(
+        required_instruments - set(instrument_symbols)
+    )
+    if missing_instruments:
+        raise ValueError(
+            "instrument master is missing policy symbols: "
+            + ", ".join(missing_instruments)
+        )
+    instrument_identity = hashlib.sha256(
+        json.dumps(
+            normalized_instruments,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     normalized_holdings = [
         {
             "symbol": holding.symbol.strip().upper(),
@@ -333,7 +385,12 @@ def write_backtest_artifacts(
     destination = _run_directory(
         output_root,
         hashlib.sha256(
-            (policy_hash + prices_hash + holdings_fingerprint).encode()
+            (
+                policy_hash
+                + prices_hash
+                + holdings_fingerprint
+                + instrument_identity
+            ).encode()
         ).hexdigest(),
     )
 
@@ -344,6 +401,18 @@ def write_backtest_artifacts(
         normalized_holdings,
         ["symbol", "quantity"],
     )
+    _write_csv(
+        destination / "instrument_master.csv",
+        normalized_instruments,
+        [
+            "symbol",
+            "exchange",
+            "asset_type",
+            "listed_on",
+            "delisted_on",
+            "available_at",
+        ],
+    )
     if dataset_manifest is not None:
         _write_json(
             destination / "dataset.snapshot.json", dict(dataset_manifest)
@@ -353,6 +422,7 @@ def write_backtest_artifacts(
         "manifest.json",
         "accounting.csv",
         "initial_holdings.csv",
+        "instrument_master.csv",
         "ledger.csv",
         "metrics.json",
         "nav.csv",
@@ -385,6 +455,10 @@ def write_backtest_artifacts(
         "initial_holdings_snapshot_sha256": file_sha256[
             "initial_holdings.csv"
         ],
+        "instrument_master_source": instrument_master_source,
+        "instrument_master_snapshot_sha256": file_sha256[
+            "instrument_master.csv"
+        ],
         "project_root": str(project_root),
         "source_revision": _git_revision(project_root),
         "source_tree_sha256": _source_tree_sha256(project_root),
@@ -396,6 +470,9 @@ def write_backtest_artifacts(
                 "dataset_id": dataset_manifest.get("dataset_id"),
                 "as_of": dataset_manifest.get("as_of"),
                 "quality_status": dataset_manifest.get("quality_status"),
+                "instrument_master_sha256": dataset_manifest.get(
+                    "files", {}
+                ).get("instruments.csv"),
                 "source_snapshot_id": (
                     dataset_manifest.get("source_snapshot", {}).get(
                         "snapshot_id"

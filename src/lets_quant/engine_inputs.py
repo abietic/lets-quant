@@ -8,10 +8,19 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from .cross_engine import EngineValidationError, file_sha256
-from .data import DataError, load_holdings, load_prices
+from .cross_engine import (
+    EngineValidationError,
+    file_sha256,
+    read_instrument_master_rows,
+)
+from .data import (
+    DataError,
+    generated_instrument_master,
+    load_holdings,
+    load_prices,
+)
 from .datasets import load_curated_dataset
-from .models import MarketData
+from .models import InstrumentMetadata, MarketData
 
 
 ENGINE_OBSERVATION_FIELDS = {
@@ -47,9 +56,119 @@ class EngineMarketInput:
     prices_path: Path
     reference_manifest: Dict[str, Any]
     source_type: str
+    instruments: Dict[str, InstrumentMetadata]
+    instrument_master_source: str
+    instrument_master_sha256: str
     dataset_directory: Optional[Path] = None
     dataset_manifest: Optional[Dict[str, Any]] = None
     dataset_snapshot_sha256: Optional[str] = None
+
+
+def _instrument_rows(
+    instruments: Sequence[InstrumentMetadata],
+) -> List[Dict[str, str]]:
+    return [
+        {
+            "symbol": instrument.symbol,
+            "exchange": instrument.exchange,
+            "asset_type": instrument.asset_type,
+            "listed_on": instrument.listed_on.isoformat(),
+            "delisted_on": (
+                instrument.delisted_on.isoformat()
+                if instrument.delisted_on is not None
+                else ""
+            ),
+            "available_at": (
+                instrument.available_at.isoformat()
+                if instrument.available_at is not None
+                else ""
+            ),
+        }
+        for instrument in sorted(instruments, key=lambda item: item.symbol)
+    ]
+
+
+def _load_bound_instrument_master(
+    reference_directory: Path,
+    manifest: Mapping[str, Any],
+    *,
+    expected_instruments: Sequence[InstrumentMetadata],
+    expected_source: str,
+) -> Tuple[Dict[str, InstrumentMetadata], str]:
+    path = reference_directory / "instrument_master.csv"
+    declared_hashes = manifest.get("file_sha256")
+    expected_hash = (
+        declared_hashes.get("instrument_master.csv")
+        if isinstance(declared_hashes, dict)
+        else None
+    )
+    if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+        raise EngineValidationError(
+            f"{reference_directory / 'manifest.json'} has an invalid hash "
+            "for instrument_master.csv"
+        )
+    if manifest.get("instrument_master_snapshot_sha256") != expected_hash:
+        raise EngineValidationError(
+            "reference instrument master snapshot hash is inconsistent"
+        )
+    if manifest.get("instrument_master_source") != expected_source:
+        raise EngineValidationError(
+            "reference instrument master source differs from the market input"
+        )
+    actual_hash = file_sha256(path)
+    if actual_hash != expected_hash:
+        raise EngineValidationError(
+            "reference artifact integrity failed for instrument_master.csv: "
+            f"expected {expected_hash}, got {actual_hash}"
+        )
+    actual_rows = read_instrument_master_rows(path)
+    if actual_rows != _instrument_rows(expected_instruments):
+        raise EngineValidationError(
+            "reference instrument master differs from the validated market input"
+        )
+    return (
+        {instrument.symbol: instrument for instrument in expected_instruments},
+        actual_hash,
+    )
+
+
+def build_instrument_mapping_rows(
+    market_input: EngineMarketInput,
+    *,
+    symbols: Sequence[str],
+    engine_symbols: Mapping[str, str],
+    mapping_mode: str,
+) -> List[Dict[str, str]]:
+    expected_symbols = sorted(set(symbols))
+    if set(engine_symbols) != set(expected_symbols):
+        raise EngineValidationError(
+            "engine instrument mapping must cover exactly the strategy symbols"
+        )
+    if not mapping_mode.strip():
+        raise EngineValidationError("instrument mapping mode must not be empty")
+    rows: List[Dict[str, str]] = []
+    for symbol in expected_symbols:
+        instrument = market_input.instruments.get(symbol)
+        if instrument is None:
+            raise EngineValidationError(
+                f"instrument master is missing strategy symbol {symbol}"
+            )
+        rows.append(
+            {
+                "symbol": symbol,
+                "engine_symbol": engine_symbols[symbol],
+                "exchange": instrument.exchange,
+                "asset_type": instrument.asset_type,
+                "listed_on": instrument.listed_on.isoformat(),
+                "delisted_on": (
+                    instrument.delisted_on.isoformat()
+                    if instrument.delisted_on is not None
+                    else ""
+                ),
+                "mapping_mode": mapping_mode,
+            }
+        )
+    return rows
 
 
 def load_reference_initial_positions(
@@ -312,12 +431,22 @@ def resolve_engine_market_input(
             market = load_prices(prices_path)
         except DataError as exc:
             raise EngineValidationError(str(exc)) from exc
+        generated_instruments = generated_instrument_master(market)
+        instruments, instrument_master_sha256 = _load_bound_instrument_master(
+            reference_directory,
+            verified_manifest,
+            expected_instruments=generated_instruments,
+            expected_source="generated_from_standalone_prices",
+        )
         return EngineMarketInput(
             market=market,
             bars_by_date=_standalone_bars(market),
             prices_path=prices_path,
             reference_manifest=verified_manifest,
             source_type="standalone_prices_csv",
+            instruments=instruments,
+            instrument_master_source="generated_from_standalone_prices",
+            instrument_master_sha256=instrument_master_sha256,
         )
     if source_type != "curated_dataset":
         raise EngineValidationError(
@@ -352,6 +481,9 @@ def resolve_engine_market_input(
         "dataset_id": dataset.manifest.get("dataset_id"),
         "as_of": dataset.manifest.get("as_of"),
         "quality_status": dataset.manifest.get("quality_status"),
+        "instrument_master_sha256": dataset.manifest.get("files", {}).get(
+            "instruments.csv"
+        ),
         "source_snapshot_id": (
             dataset.manifest.get("source_snapshot", {}).get("snapshot_id")
             if isinstance(dataset.manifest.get("source_snapshot"), dict)
@@ -379,12 +511,21 @@ def resolve_engine_market_input(
         raise EngineValidationError(
             "reference dataset snapshot failed its bound SHA-256"
         )
+    instruments, instrument_master_sha256 = _load_bound_instrument_master(
+        reference_directory,
+        manifest,
+        expected_instruments=list(dataset.instruments.values()),
+        expected_source="curated_dataset",
+    )
     return EngineMarketInput(
         market=dataset.market,
         bars_by_date=_curated_bars(dataset.directory, dataset.market),
         prices_path=prices_path.resolve(),
         reference_manifest=manifest,
         source_type="curated_dataset",
+        instruments=instruments,
+        instrument_master_source="curated_dataset",
+        instrument_master_sha256=instrument_master_sha256,
         dataset_directory=dataset.directory.resolve(),
         dataset_manifest=dict(dataset.manifest),
         dataset_snapshot_sha256=actual_snapshot_hash,

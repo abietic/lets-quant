@@ -24,6 +24,8 @@ from .cross_engine import (
 from .data import validate_market_coverage
 from .engine_inputs import (
     EngineBar,
+    EngineMarketInput,
+    build_instrument_mapping_rows,
     load_frozen_order_intents,
     load_json_object,
     load_reference_initial_positions,
@@ -33,10 +35,10 @@ from .independent_policy import (
     IndependentPolicyError,
     independent_signal,
 )
-from .models import CorporateAction, Policy
+from .models import CorporateAction, InstrumentMetadata, Policy
 
 
-ADAPTER_VERSION = "5"
+ADAPTER_VERSION = "6"
 SUPPORTED_RQALPHA_VERSION = "6.3.0"
 CHINA_TIMEZONE = timezone(timedelta(hours=8))
 DECISION_MODES = {"independent_policy", "frozen_orders"}
@@ -55,6 +57,7 @@ class _RuntimeContext:
     tradable_by_date: Dict[str, Dict[str, bool]]
     corporate_actions_by_date: Dict[str, List[CorporateAction]]
     price_adjustment: str
+    instruments: Dict[str, InstrumentMetadata]
     initial_positions: Dict[str, int]
     volumes: Dict[str, Dict[str, int]]
     lot_size: int
@@ -90,6 +93,40 @@ def _event_time(value: datetime) -> str:
 
 def _mapped_symbol(index: int) -> str:
     return f"LQ{index + 1:06d}.XSHG"
+
+
+def _rqalpha_instrument_mapping(
+    market_input: EngineMarketInput, symbols: Sequence[str]
+) -> Tuple[Dict[str, str], str]:
+    if market_input.source_type != "curated_dataset":
+        return {
+            symbol: _mapped_symbol(index)
+            for index, symbol in enumerate(symbols)
+        }, "standalone_synthetic_fallback"
+    supported_exchanges = {"XSHG", "XSHE"}
+    supported_asset_types = {"CS", "ETF"}
+    for symbol in symbols:
+        instrument = market_input.instruments.get(symbol)
+        if instrument is None:
+            raise EngineValidationError(
+                f"RQAlpha instrument master is missing {symbol}"
+            )
+        if instrument.exchange not in supported_exchanges:
+            raise EngineValidationError(
+                "RQAlpha canonical mapping does not support exchange "
+                f"{instrument.exchange} for {symbol}"
+            )
+        if instrument.asset_type not in supported_asset_types:
+            raise EngineValidationError(
+                "RQAlpha canonical mapping does not support asset_type "
+                f"{instrument.asset_type} for {symbol}"
+            )
+        if not symbol.endswith(f".{instrument.exchange}"):
+            raise EngineValidationError(
+                f"RQAlpha canonical symbol {symbol} does not match exchange "
+                f"{instrument.exchange}"
+            )
+    return {symbol: symbol for symbol in symbols}, "curated_canonical"
 
 
 def _load_liquidity(
@@ -178,7 +215,7 @@ class _FrozenDailyDataSource:
         self._np = np
         self._pd = pd
         self._calendar_type = TRADING_CALENDAR_TYPE.CN_STOCK
-        self._instrument_type = INSTRUMENT_TYPE.CS
+        self._instrument_types = set()
         self._exchange_rate_type = ExchangeRate
         self._runtime = runtime
         first_date = date.fromisoformat(runtime.trading_dates[0])
@@ -191,15 +228,25 @@ class _FrozenDailyDataSource:
         self._aliases: Dict[str, Any] = {}
         for symbol in runtime.symbols:
             mapped = runtime.mapped_symbols[symbol]
+            metadata = runtime.instruments[symbol]
+            synthetic = metadata.exchange == "SYNTH"
+            instrument_type_name = "CS" if synthetic else metadata.asset_type
+            exchange = "XSHG" if synthetic else metadata.exchange
+            instrument_type = INSTRUMENT_TYPE[instrument_type_name]
+            self._instrument_types.add(instrument_type)
             instrument = Instrument(
                 {
                     "order_book_id": mapped,
                     "symbol": symbol,
                     "round_lot": runtime.lot_size,
-                    "listed_date": (first_date - timedelta(days=365)).isoformat(),
-                    "de_listed_date": (last_date + timedelta(days=365)).isoformat(),
-                    "type": "CS",
-                    "exchange": "XSHG",
+                    "listed_date": metadata.listed_on.isoformat(),
+                    "de_listed_date": (
+                        metadata.delisted_on.isoformat()
+                        if metadata.delisted_on is not None
+                        else (last_date + timedelta(days=365)).isoformat()
+                    ),
+                    "type": instrument_type_name,
+                    "exchange": exchange,
                     "board_type": "MainBoard",
                     "status": "Active",
                     "special_type": "Normal",
@@ -232,9 +279,10 @@ class _FrozenDailyDataSource:
                     seen.add(instrument)
                     yield instrument
             return
-        allowed = set(types or [self._instrument_type])
-        if self._instrument_type in allowed:
-            yield from self._instruments.values()
+        allowed = set(types or self._instrument_types)
+        for instrument in self._instruments.values():
+            if instrument.type in allowed:
+                yield instrument
 
     def get_trading_calendars(self) -> Dict[Any, Any]:
         return {self._calendar_type: self._calendar}
@@ -891,6 +939,32 @@ def _record_corporate_action_rejection(
     )
 
 
+def _record_tradability_rejection(
+    context: Any,
+    runtime: _RuntimeContext,
+    intent: Mapping[str, Any],
+) -> None:
+    runtime.events.append(
+        {
+            "sequence": len(runtime.events) + 1,
+            "event_time": _event_time(context.now),
+            "event_type": "order_tradability_reject",
+            "order_id": f"rqalpha-tradability-{int(intent['sequence']) + 1}",
+            "trade_id": "",
+            "symbol": intent["symbol"],
+            "side": intent["side"],
+            "requested_quantity": int(intent["quantity"]),
+            "cumulative_filled_quantity": 0,
+            "event_fill_quantity": 0,
+            "order_status": "REJECTED",
+            "fill_price": 0.0,
+            "commission": 0.0,
+            "tax": 0.0,
+            "message": "non-common-stock suspension rejected before submission",
+        }
+    )
+
+
 def _strategy_handle_bar(context: Any, bar_dict: Any) -> None:
     runtime = _RUNTIMES[context.lets_quant_runtime_id]
     trading_date = context.now.date().isoformat()
@@ -910,6 +984,11 @@ def _strategy_handle_bar(context: Any, bar_dict: Any) -> None:
     ):
         if _crosses_quantity_changing_action(runtime, intent):
             _record_corporate_action_rejection(context, runtime, intent)
+        elif (
+            not runtime.tradable_by_date[trading_date][intent["symbol"]]
+            and runtime.instruments[intent["symbol"]].asset_type != "CS"
+        ):
+            _record_tradability_rejection(context, runtime, intent)
         else:
             _submit_intent(context, runtime, intent)
 
@@ -1159,7 +1238,7 @@ def run_rqalpha_validation(
         reference_directory,
         supplied_prices_path=prices_path,
         supplied_dataset_path=dataset_path,
-        adapter_name="RQAlpha adapter v5",
+        adapter_name="RQAlpha adapter v6",
     )
     reference_metrics = load_json_object(
         reference_directory / "metrics.json"
@@ -1176,12 +1255,21 @@ def run_rqalpha_validation(
         )
     market = market_input.market
     symbols = sorted(policy.strategy.target_weights)
+    mapped_symbols, instrument_mapping_mode = _rqalpha_instrument_mapping(
+        market_input, symbols
+    )
+    instrument_mapping_rows = build_instrument_mapping_rows(
+        market_input,
+        symbols=symbols,
+        engine_symbols=mapped_symbols,
+        mapping_mode=instrument_mapping_mode,
+    )
     initial_positions, initial_holdings_sha256 = (
         load_reference_initial_positions(
             reference_directory,
             symbols=symbols,
             lot_size=policy.execution.lot_size,
-            adapter_name="RQAlpha adapter v5",
+            adapter_name="RQAlpha adapter v6",
         )
     )
     validate_market_coverage(market, symbols)
@@ -1210,7 +1298,7 @@ def run_rqalpha_validation(
             symbols=symbols,
             trading_dates=trading_dates,
             market_prices=market_prices,
-            adapter_name="RQAlpha adapter v5 frozen-orders mode",
+            adapter_name="RQAlpha adapter v6 frozen-orders mode",
         )
     else:
         intents = []
@@ -1231,9 +1319,6 @@ def run_rqalpha_validation(
         symbols=symbols,
         default_volumes=default_volumes,
     )
-    mapped_symbols = {
-        symbol: _mapped_symbol(index) for index, symbol in enumerate(symbols)
-    }
     runtime = _RuntimeContext(
         trading_dates=trading_dates,
         symbols=symbols,
@@ -1263,6 +1348,7 @@ def run_rqalpha_validation(
             for trading_date in trading_dates
         },
         price_adjustment=market.price_adjustment,
+        instruments=market_input.instruments,
         initial_positions=initial_positions,
         volumes=volumes,
         lot_size=policy.execution.lot_size,
@@ -1382,6 +1468,9 @@ def run_rqalpha_validation(
         "initial_position_count": sum(
             1 for quantity in initial_positions.values() if quantity > 0
         ),
+        "instrument_master_sha256": market_input.instrument_master_sha256,
+        "instrument_master_source": market_input.instrument_master_source,
+        "instrument_mapping_mode": instrument_mapping_mode,
     }
     if market_input.dataset_manifest is not None:
         market_scope.update(
@@ -1446,12 +1535,14 @@ def run_rqalpha_validation(
                 "long-only opening positions initialized by the account model",
             ],
             "adapter_mapped_components": [
-                "synthetic RQAlpha instrument identifiers",
+                "standalone synthetic identifiers or curated canonical "
+                "instrument metadata",
                 "policy strategy semantics, target-lot sizing, turnover gate, "
                 "and sell-before-buy submission",
                 "dynamic cash-buffer withdrawal and immediate redeposit",
                 "standalone closes mapped to flat OHLC or curated OHLCV bars",
                 "curated suspension state mapped to RQAlpha tradability checks",
+                "non-common-stock suspension rejected by an adapter precheck",
                 "cross-action pending intent invalidation before submission",
                 "a pre-start calendar sentinel valued at the first close for "
                 "native opening-position initialization",
@@ -1470,7 +1561,7 @@ def run_rqalpha_validation(
         limitations=[
             "Parity validates software behavior for this frozen input only; it "
             "does not establish strategy or investment validity.",
-            "Adapter v5 accepts standalone prices or validated curated daily "
+            "Adapter v6 accepts standalone prices or validated curated daily "
             "datasets, long-only opening positions inside the strategy scope, "
             "and at most one order per symbol/date.",
             "Adjusted datasets keep declared actions informational; unadjusted "
@@ -1486,9 +1577,11 @@ def run_rqalpha_validation(
             "Cash-buffer reserve mapping is adapter logic; fill quantities, native "
             "order states, transaction costs, and account changes are produced "
             "by RQAlpha.",
-            "Synthetic common-stock instruments reproduce the configured fee and "
-            "lot rules but do not establish exchange-specific market realism.",
+            "Standalone prices use synthetic common-stock identifiers; curated "
+            "datasets use bound canonical exchange and asset-type metadata, but "
+            "neither establishes exchange-specific market realism.",
         ],
+        instrument_mapping_rows=instrument_mapping_rows,
     )
     report = reconcile_engine_candidate(
         reference_directory,

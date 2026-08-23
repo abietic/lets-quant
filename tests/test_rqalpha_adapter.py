@@ -105,6 +105,20 @@ class RqalphaAdapterTest(unittest.TestCase):
             events = (candidate / "events.csv").read_text(encoding="utf-8")
             self.assertIn("order_unsolicited_update", events)
             self.assertIn("fill 3800 actually", events)
+            manifest = json.loads(
+                (candidate / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["validation_scope"]["instrument_mapping_mode"],
+                "standalone_synthetic_fallback",
+            )
+            with (candidate / "instrument_mapping.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                mappings = list(csv.DictReader(handle))
+            self.assertTrue(
+                all(row["engine_symbol"].startswith("LQ") for row in mappings)
+            )
 
     def test_nonzero_initial_holdings_use_native_account_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -415,7 +429,7 @@ class RqalphaAdapterTest(unittest.TestCase):
                 "maximum drawdown risk freeze is active",
             )
 
-    def test_curated_ohlcv_suspension_uses_native_rejection(self) -> None:
+    def test_curated_etf_suspension_uses_adapter_precheck(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temporary = Path(temp_dir)
             fixture = build_curated_reference(
@@ -460,6 +474,19 @@ class RqalphaAdapterTest(unittest.TestCase):
             )
             scope = manifest["validation_scope"]
             self.assertEqual(scope["bar_mapping"], "curated_ohlcv")
+            self.assertEqual(
+                scope["instrument_mapping_mode"], "curated_canonical"
+            )
+            with (candidate / "instrument_mapping.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                mappings = list(csv.DictReader(handle))
+            self.assertTrue(
+                all(row["symbol"] == row["engine_symbol"] for row in mappings)
+            )
+            self.assertEqual(
+                {row["asset_type"] for row in mappings}, {"ETF"}
+            )
 
     def test_unadjusted_cash_dividend_uses_native_accounting(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

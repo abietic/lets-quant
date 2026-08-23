@@ -11,7 +11,24 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+INSTRUMENT_MASTER_FIELDS = [
+    "symbol",
+    "exchange",
+    "asset_type",
+    "listed_on",
+    "delisted_on",
+    "available_at",
+]
+INSTRUMENT_MAPPING_FIELDS = [
+    "symbol",
+    "engine_symbol",
+    "exchange",
+    "asset_type",
+    "listed_on",
+    "delisted_on",
+    "mapping_mode",
+]
 NAV_FIELDS = ["date", "nav", "cash", "positions"]
 TRADE_FIELDS = [
     "signal_date",
@@ -279,6 +296,166 @@ def _validated_scope(value: Any, location: str) -> Dict[str, Any]:
                 f"{location}.{field} must contain non-empty strings"
             )
     return scope
+
+
+def _validated_iso_date(
+    value: Any, location: str, *, allow_empty: bool = False
+) -> str:
+    normalized = str(value or "").strip()
+    if allow_empty and not normalized:
+        return ""
+    try:
+        datetime.strptime(normalized, "%Y-%m-%d")
+    except ValueError as exc:
+        raise EngineValidationError(
+            f"{location} must be YYYY-MM-DD"
+        ) from exc
+    return normalized
+
+
+def read_instrument_master_rows(path: Path) -> List[Dict[str, str]]:
+    try:
+        handle = path.open(newline="", encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise EngineValidationError(f"file not found: {path}") from exc
+    rows: List[Dict[str, str]] = []
+    seen_symbols = set()
+    with handle:
+        reader = csv.DictReader(handle)
+        if list(reader.fieldnames or []) != INSTRUMENT_MASTER_FIELDS:
+            raise EngineValidationError(
+                f"{path} must have exactly these ordered columns: "
+                + ", ".join(INSTRUMENT_MASTER_FIELDS)
+            )
+        for line_number, row in enumerate(reader, start=2):
+            location = f"{path}:{line_number}"
+            symbol = str(row.get("symbol") or "").strip().upper()
+            exchange = str(row.get("exchange") or "").strip().upper()
+            asset_type = str(row.get("asset_type") or "").strip().upper()
+            if not symbol or symbol in seen_symbols:
+                raise EngineValidationError(
+                    f"{location}:symbol is empty or duplicated"
+                )
+            if not exchange or not asset_type:
+                raise EngineValidationError(
+                    f"{location}:exchange and asset_type must not be empty"
+                )
+            seen_symbols.add(symbol)
+            listed_on = _validated_iso_date(
+                row.get("listed_on"), f"{location}:listed_on"
+            )
+            delisted_on = _validated_iso_date(
+                row.get("delisted_on"),
+                f"{location}:delisted_on",
+                allow_empty=True,
+            )
+            if delisted_on and delisted_on < listed_on:
+                raise EngineValidationError(
+                    f"{location}:delisted_on is earlier than listed_on"
+                )
+            available_at = str(row.get("available_at") or "").strip()
+            if available_at:
+                try:
+                    parsed_available_at = datetime.fromisoformat(
+                        available_at.replace("Z", "+00:00")
+                    )
+                except ValueError as exc:
+                    raise EngineValidationError(
+                        f"{location}:available_at must be ISO-8601"
+                    ) from exc
+                if parsed_available_at.tzinfo is None:
+                    raise EngineValidationError(
+                        f"{location}:available_at must include a timezone"
+                    )
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "asset_type": asset_type,
+                    "listed_on": listed_on,
+                    "delisted_on": delisted_on,
+                    "available_at": available_at,
+                }
+            )
+    if not rows:
+        raise EngineValidationError(f"{path} contains no instruments")
+    if rows != sorted(rows, key=lambda item: item["symbol"]):
+        raise EngineValidationError(
+            f"{path} instruments must use canonical symbol order"
+        )
+    return rows
+
+
+def read_instrument_mapping_rows(path: Path) -> List[Dict[str, str]]:
+    try:
+        handle = path.open(newline="", encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise EngineValidationError(f"file not found: {path}") from exc
+    rows: List[Dict[str, str]] = []
+    seen_symbols = set()
+    seen_engine_symbols = set()
+    with handle:
+        reader = csv.DictReader(handle)
+        if list(reader.fieldnames or []) != INSTRUMENT_MAPPING_FIELDS:
+            raise EngineValidationError(
+                f"{path} must have exactly these ordered columns: "
+                + ", ".join(INSTRUMENT_MAPPING_FIELDS)
+            )
+        for line_number, row in enumerate(reader, start=2):
+            location = f"{path}:{line_number}"
+            symbol = str(row.get("symbol") or "").strip().upper()
+            engine_symbol = str(
+                row.get("engine_symbol") or ""
+            ).strip().upper()
+            exchange = str(row.get("exchange") or "").strip().upper()
+            asset_type = str(row.get("asset_type") or "").strip().upper()
+            mapping_mode = str(
+                row.get("mapping_mode") or ""
+            ).strip().lower()
+            if not symbol or symbol in seen_symbols:
+                raise EngineValidationError(
+                    f"{location}:symbol is empty or duplicated"
+                )
+            if not engine_symbol or engine_symbol in seen_engine_symbols:
+                raise EngineValidationError(
+                    f"{location}:engine_symbol is empty or duplicated"
+                )
+            if not exchange or not asset_type or not mapping_mode:
+                raise EngineValidationError(
+                    f"{location}:instrument mapping metadata is incomplete"
+                )
+            seen_symbols.add(symbol)
+            seen_engine_symbols.add(engine_symbol)
+            listed_on = _validated_iso_date(
+                row.get("listed_on"), f"{location}:listed_on"
+            )
+            delisted_on = _validated_iso_date(
+                row.get("delisted_on"),
+                f"{location}:delisted_on",
+                allow_empty=True,
+            )
+            if delisted_on and delisted_on < listed_on:
+                raise EngineValidationError(
+                    f"{location}:delisted_on is earlier than listed_on"
+                )
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "engine_symbol": engine_symbol,
+                    "exchange": exchange,
+                    "asset_type": asset_type,
+                    "listed_on": listed_on,
+                    "delisted_on": delisted_on,
+                    "mapping_mode": mapping_mode,
+                }
+            )
+    if not rows:
+        raise EngineValidationError(f"{path} contains no instrument mappings")
+    if rows != sorted(rows, key=lambda item: item["symbol"]):
+        raise EngineValidationError(
+            f"{path} instrument mappings must use canonical symbol order"
+        )
+    return rows
 
 
 def read_nav_rows(path: Path, *, candidate: bool = False) -> List[Dict[str, Any]]:
@@ -1227,8 +1404,25 @@ def reference_identity(reference_directory: Path) -> Dict[str, Any]:
         raise EngineValidationError(
             f"{manifest_path} initial holdings snapshot hash is inconsistent"
         )
+    instrument_master_hash = declared_hashes.get("instrument_master.csv")
+    if (
+        instrument_master_hash is not None
+        and manifest.get("instrument_master_snapshot_sha256")
+        != instrument_master_hash
+    ):
+        raise EngineValidationError(
+            f"{manifest_path} instrument master snapshot hash is inconsistent"
+        )
+    instrument_master_source = manifest.get("instrument_master_source")
+    if not isinstance(instrument_master_source, str) or not (
+        instrument_master_source.strip()
+    ):
+        raise EngineValidationError(
+            f"{manifest_path} instrument_master_source must not be empty"
+        )
     required = [
         "policy.snapshot.json",
+        "instrument_master.csv",
         "ledger.csv",
         "metrics.json",
         "nav.csv",
@@ -1241,6 +1435,7 @@ def reference_identity(reference_directory: Path) -> Dict[str, Any]:
             f"{manifest_path} is missing required artifacts: "
             + ", ".join(missing_required)
         )
+    read_instrument_master_rows(reference_directory / "instrument_master.csv")
     file_hashes = {name: declared_hashes[name] for name in required}
     policy_input_hash = manifest.get("policy_sha256")
     prices_input_hash = manifest.get("prices_sha256")
@@ -1260,6 +1455,8 @@ def reference_identity(reference_directory: Path) -> Dict[str, Any]:
         "policy_snapshot_sha256": file_hashes["policy.snapshot.json"],
         "ledger_sha256": file_hashes["ledger.csv"],
         "initial_holdings_sha256": initial_holdings_hash,
+        "instrument_master_sha256": file_hashes["instrument_master.csv"],
+        "instrument_master_source": instrument_master_source,
         "metrics_sha256": file_hashes["metrics.json"],
         "nav_sha256": file_hashes["nav.csv"],
         "signals_sha256": file_hashes["signals.csv"],
@@ -1332,6 +1529,7 @@ def write_engine_candidate(
     metrics: Mapping[str, Any],
     validation_scope: Mapping[str, Any],
     limitations: Sequence[str],
+    instrument_mapping_rows: Sequence[Mapping[str, Any]],
     order_rows: Optional[Sequence[Mapping[str, Any]]] = None,
     event_rows: Optional[Sequence[Mapping[str, Any]]] = None,
     signal_rows: Optional[Sequence[Mapping[str, Any]]] = None,
@@ -1428,6 +1626,18 @@ def write_engine_candidate(
         destination / "metrics.json",
         {field: metrics[field] for field in METRIC_FIELDS},
     )
+    _write_csv(
+        destination / "instrument_mapping.csv",
+        (
+            {
+                field: row[field]
+                for field in INSTRUMENT_MAPPING_FIELDS
+            }
+            for row in instrument_mapping_rows
+        ),
+        INSTRUMENT_MAPPING_FIELDS,
+    )
+    read_instrument_mapping_rows(destination / "instrument_mapping.csv")
     if signal_rows is not None:
         _write_csv(
             destination / "signals.csv",
@@ -1522,7 +1732,12 @@ def write_engine_candidate(
         read_corporate_action_rows(destination / "corporate_actions.csv")
     files = {
         name: file_sha256(destination / name)
-        for name in ("metrics.json", "nav.csv", "trades.csv")
+        for name in (
+            "instrument_mapping.csv",
+            "metrics.json",
+            "nav.csv",
+            "trades.csv",
+        )
     }
     if order_rows is not None:
         files.update(
@@ -2243,6 +2458,100 @@ def _validate_corporate_actions(
     }
 
 
+def _validate_instrument_mapping(
+    reference_rows: Sequence[Mapping[str, str]],
+    candidate_rows: Sequence[Mapping[str, str]],
+    *,
+    expected_symbols: Sequence[str],
+    declared_mode: Any,
+    declared_master_hash: Any,
+    declared_master_source: Any,
+    expected_master_hash: str,
+    master_source: str,
+) -> Dict[str, Any]:
+    mismatches: List[Dict[str, Any]] = []
+    reference_by_symbol = {row["symbol"]: row for row in reference_rows}
+    candidate_by_symbol = {row["symbol"]: row for row in candidate_rows}
+    expected = set(expected_symbols)
+    if set(candidate_by_symbol) != expected:
+        mismatches.append(
+            {
+                "field": "symbols",
+                "expected": sorted(expected),
+                "actual": sorted(candidate_by_symbol),
+            }
+        )
+    missing_reference = sorted(expected - set(reference_by_symbol))
+    if missing_reference:
+        mismatches.append(
+            {
+                "field": "reference_instrument_master",
+                "expected": sorted(expected),
+                "actual_missing": missing_reference,
+            }
+        )
+    comparable_symbols = (
+        expected & set(candidate_by_symbol) & set(reference_by_symbol)
+    )
+    for symbol in sorted(comparable_symbols):
+        reference_row = reference_by_symbol[symbol]
+        candidate_row = candidate_by_symbol[symbol]
+        for field in (
+            "exchange",
+            "asset_type",
+            "listed_on",
+            "delisted_on",
+        ):
+            if candidate_row[field] != reference_row[field]:
+                mismatches.append(
+                    {
+                        "symbol": symbol,
+                        "field": field,
+                        "expected": reference_row[field],
+                        "actual": candidate_row[field],
+                    }
+                )
+    modes = sorted({row["mapping_mode"] for row in candidate_rows})
+    if (
+        not isinstance(declared_mode, str)
+        or declared_mode not in modes
+        or len(modes) != 1
+    ):
+        mismatches.append(
+            {
+                "field": "instrument_mapping_mode",
+                "expected": modes[0] if len(modes) == 1 else modes,
+                "actual": declared_mode,
+            }
+        )
+    if declared_master_hash != expected_master_hash:
+        mismatches.append(
+            {
+                "field": "instrument_master_sha256",
+                "expected": expected_master_hash,
+                "actual": declared_master_hash,
+            }
+        )
+    if declared_master_source != master_source:
+        mismatches.append(
+            {
+                "field": "instrument_master_source",
+                "expected": master_source,
+                "actual": declared_master_source,
+            }
+        )
+    return {
+        "passed": not mismatches,
+        "details": {
+            "reference_instrument_count": len(reference_rows),
+            "candidate_mapping_count": len(candidate_rows),
+            "mapping_mode": modes[0] if len(modes) == 1 else modes,
+            "instrument_master_source": master_source,
+            "mismatches": _differences_limited(mismatches),
+        },
+    }
+
+
 def reconcile_engine_candidate(
     reference_directory: Path,
     candidate_directory: Path,
@@ -2361,7 +2670,12 @@ def reconcile_engine_candidate(
         )
     )
 
-    base_candidate_files = {"metrics.json", "nav.csv", "trades.csv"}
+    base_candidate_files = {
+        "instrument_mapping.csv",
+        "metrics.json",
+        "nav.csv",
+        "trades.csv",
+    }
     lifecycle_candidate_files = {"orders.csv", "events.csv"}
     decision_candidate_files = {"signals.csv"}
     action_candidate_files = {"corporate_actions.csv"}
@@ -2457,6 +2771,33 @@ def reconcile_engine_candidate(
     reference_nav = read_nav_rows(reference_directory / "nav.csv")
     candidate_nav = read_nav_rows(
         candidate_directory / "nav.csv", candidate=True
+    )
+    reference_instruments = read_instrument_master_rows(
+        reference_directory / "instrument_master.csv"
+    )
+    candidate_instruments = read_instrument_mapping_rows(
+        candidate_directory / "instrument_mapping.csv"
+    )
+    instrument_mapping_result = _validate_instrument_mapping(
+        reference_instruments,
+        candidate_instruments,
+        expected_symbols=sorted(reference_nav[0]["positions"]),
+        declared_mode=validation_scope.get("instrument_mapping_mode"),
+        declared_master_hash=validation_scope.get(
+            "instrument_master_sha256"
+        ),
+        declared_master_source=validation_scope.get(
+            "instrument_master_source"
+        ),
+        expected_master_hash=current_reference["instrument_master_sha256"],
+        master_source=current_reference["instrument_master_source"],
+    )
+    checks.append(
+        _check(
+            "instrument_mapping",
+            instrument_mapping_result["passed"],
+            instrument_mapping_result["details"],
+        )
     )
     reference_dates = [row["date"] for row in reference_nav]
     candidate_dates = [row["date"] for row in candidate_nav]
@@ -2772,6 +3113,7 @@ def reconcile_engine_candidate(
             "policy_decisions": decision_summary,
             "order_lifecycle": lifecycle_summary,
             "corporate_actions": corporate_action_summary,
+            "instrument_mapping": instrument_mapping_result["details"],
         },
         "investment_validity_established": False,
         "automatic_execution_allowed": False,

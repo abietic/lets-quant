@@ -21,13 +21,14 @@ from .cross_engine import (
 )
 from .data import validate_market_coverage
 from .engine_inputs import (
+    build_instrument_mapping_rows,
     load_frozen_order_intents,
     load_reference_initial_positions,
     resolve_engine_market_input,
 )
 
 
-ADAPTER_VERSION = "4"
+ADAPTER_VERSION = "5"
 SUPPORTED_VECTORBT_VERSION = "1.1.0"
 
 def run_vectorbt_validation(
@@ -67,16 +68,24 @@ def run_vectorbt_validation(
         reference_directory,
         supplied_prices_path=prices_path,
         supplied_dataset_path=dataset_path,
-        adapter_name="VectorBT adapter v4",
+        adapter_name="VectorBT adapter v5",
     )
     market = market_input.market
     symbols = sorted(policy.strategy.target_weights)
+    engine_symbols = {symbol: symbol for symbol in symbols}
+    instrument_mapping_mode = "canonical_identity"
+    instrument_mapping_rows = build_instrument_mapping_rows(
+        market_input,
+        symbols=symbols,
+        engine_symbols=engine_symbols,
+        mapping_mode=instrument_mapping_mode,
+    )
     initial_positions, initial_holdings_sha256 = (
         load_reference_initial_positions(
             reference_directory,
             symbols=symbols,
             lot_size=policy.execution.lot_size,
-            adapter_name="VectorBT adapter v4",
+            adapter_name="VectorBT adapter v5",
         )
     )
     validate_market_coverage(market, symbols)
@@ -105,7 +114,7 @@ def run_vectorbt_validation(
         symbols=symbols,
         trading_dates=trading_dates,
         market_prices=market_prices,
-        adapter_name="VectorBT adapter v4",
+        adapter_name="VectorBT adapter v5",
     )
 
     close = pd.DataFrame(
@@ -513,6 +522,9 @@ def run_vectorbt_validation(
         "initial_position_count": sum(
             1 for quantity in initial_positions.values() if quantity > 0
         ),
+        "instrument_master_sha256": market_input.instrument_master_sha256,
+        "instrument_master_source": market_input.instrument_master_source,
+        "instrument_mapping_mode": instrument_mapping_mode,
     }
     if market_input.dataset_manifest is not None:
         market_scope.update(
@@ -575,7 +587,7 @@ def run_vectorbt_validation(
         limitations=[
             "Parity validates software behavior for this frozen input only; it "
             "does not establish strategy or investment validity.",
-            "Adapter v4 accepts standalone prices or validated curated daily "
+            "Adapter v5 accepts standalone prices or validated curated daily "
             "datasets, long-only opening positions inside the strategy scope, "
             "and at most one order per symbol/date.",
             "Curated tradability rejection is adapter logic; VectorBT does not "
@@ -589,6 +601,7 @@ def run_vectorbt_validation(
             "lowered by adapter code because VectorBT has no equivalent native "
             "rule; parity does not independently prove that sizing formula.",
         ],
+        instrument_mapping_rows=instrument_mapping_rows,
     )
     report = reconcile_engine_candidate(
         reference_directory,

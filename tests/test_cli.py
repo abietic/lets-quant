@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import hashlib
 import io
 import json
@@ -39,6 +40,7 @@ class CliTest(unittest.TestCase):
                 {
                     "accounting.csv",
                     "initial_holdings.csv",
+                    "instrument_master.csv",
                     "ledger.csv",
                     "manifest.json",
                     "metrics.json",
@@ -64,6 +66,24 @@ class CliTest(unittest.TestCase):
                     ).hexdigest(),
                     expected_hash,
                 )
+            self.assertEqual(
+                manifest["instrument_master_source"],
+                "generated_from_standalone_prices",
+            )
+            self.assertEqual(
+                manifest["instrument_master_snapshot_sha256"],
+                manifest["file_sha256"]["instrument_master.csv"],
+            )
+            with (run_directories[0] / "instrument_master.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                instruments = list(csv.DictReader(handle))
+            self.assertEqual(
+                {row["exchange"] for row in instruments}, {"SYNTH"}
+            )
+            self.assertEqual(
+                {row["asset_type"] for row in instruments}, {"SYNTHETIC"}
+            )
 
     def test_backtest_snapshots_nonzero_initial_holdings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -209,6 +229,19 @@ class CliTest(unittest.TestCase):
             self.assertEqual(
                 manifest["data_source"]["dataset_id"],
                 curated_payload["dataset_id"],
+            )
+            dataset_manifest = json.loads(
+                (
+                    Path(curated_payload["dataset_directory"])
+                    / "manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["data_source"]["instrument_master_sha256"],
+                dataset_manifest["files"]["instruments.csv"],
+            )
+            self.assertEqual(
+                manifest["instrument_master_source"], "curated_dataset"
             )
             metrics = json.loads(
                 (run_directory / "metrics.json").read_text(encoding="utf-8")

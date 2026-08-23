@@ -138,6 +138,17 @@ class VectorbtAdapterTest(unittest.TestCase):
             self.assertEqual(
                 manifest["validation_scope"]["initial_position_count"], 3
             )
+            self.assertEqual(
+                manifest["validation_scope"]["instrument_mapping_mode"],
+                "canonical_identity",
+            )
+            with (candidate / "instrument_mapping.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                mappings = list(csv.DictReader(handle))
+            self.assertTrue(
+                all(row["symbol"] == row["engine_symbol"] for row in mappings)
+            )
 
     def test_first_day_split_applies_after_opening_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

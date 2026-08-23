@@ -11,8 +11,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set
 
-from .data import DataError, load_prices
-from .models import CorporateAction, MarketData, Policy
+from .data import DataError, load_instrument_master, load_prices
+from .models import CorporateAction, InstrumentMetadata, MarketData, Policy
 from .research import ResearchPolicy, load_research_policy
 from .snapshots import (
     RawSnapshot,
@@ -37,14 +37,6 @@ BAR_COLUMNS = {
     "adjustment",
 }
 CALENDAR_COLUMNS = {"date", "is_open", "available_at"}
-INSTRUMENT_COLUMNS = {
-    "symbol",
-    "exchange",
-    "asset_type",
-    "listed_on",
-    "delisted_on",
-    "available_at",
-}
 SUSPENSION_COLUMNS = {"date", "symbol", "available_at"}
 ACTION_COLUMNS = {
     "symbol",
@@ -76,6 +68,7 @@ class CuratedDataset:
     directory: Path
     manifest: Dict[str, Any]
     market: MarketData
+    instruments: Dict[str, InstrumentMetadata]
 
     @property
     def dataset_id(self) -> str:
@@ -370,35 +363,17 @@ def _parse_calendar(path: Path, as_of: datetime) -> Dict[date, bool]:
 def _parse_instruments(
     path: Path, as_of: datetime
 ) -> Dict[str, Dict[str, Any]]:
-    instruments: Dict[str, Dict[str, Any]] = {}
-    for line_number, row in _read_csv(path, INSTRUMENT_COLUMNS):
-        prefix = f"{path}:{line_number}"
-        available_at = parse_timestamp(
-            row["available_at"], f"{prefix}:available_at"
-        )
-        if available_at > as_of:
-            continue
-        symbol = row["symbol"].strip().upper()
-        if not symbol:
-            raise DataError(f"{prefix}:symbol must not be empty")
-        if symbol in instruments:
-            raise DataError(f"{prefix}:duplicate instrument symbol")
-        listed_on = _parse_date(row["listed_on"], f"{prefix}:listed_on")
-        delisted_on = _parse_date(
-            row["delisted_on"], f"{prefix}:delisted_on", allow_empty=True
-        )
-        assert listed_on is not None
-        if delisted_on is not None and delisted_on < listed_on:
-            raise DataError(f"{prefix}:delisted_on is earlier than listed_on")
-        instruments[symbol] = {
-            "symbol": symbol,
-            "exchange": row["exchange"].strip().upper(),
-            "asset_type": row["asset_type"].strip().upper(),
-            "listed_on": listed_on,
-            "delisted_on": delisted_on,
-            "available_at": available_at,
+    return {
+        instrument.symbol: {
+            "symbol": instrument.symbol,
+            "exchange": instrument.exchange,
+            "asset_type": instrument.asset_type,
+            "listed_on": instrument.listed_on,
+            "delisted_on": instrument.delisted_on,
+            "available_at": instrument.available_at,
         }
-    return instruments
+        for instrument in load_instrument_master(path, as_of=as_of)
+    }
 
 
 def _parse_suspensions(
@@ -1326,8 +1301,17 @@ def load_curated_dataset(path: Path) -> CuratedDataset:
         corporate_actions_by_date=actions_by_date,
         price_adjustment=price_adjustment,
     )
+    instruments = {
+        instrument.symbol: instrument
+        for instrument in load_instrument_master(
+            directory / "instruments.csv", as_of=as_of
+        )
+    }
     return CuratedDataset(
-        directory=directory, manifest=manifest, market=market
+        directory=directory,
+        manifest=manifest,
+        market=market,
+        instruments=instruments,
     )
 
 

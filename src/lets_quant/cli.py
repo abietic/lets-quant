@@ -19,7 +19,12 @@ from .cross_engine import (
     reconcile_engine_candidate,
     write_reconciliation_report,
 )
-from .data import DataError, load_holdings, load_prices
+from .data import (
+    DataError,
+    generated_instrument_master,
+    load_holdings,
+    load_prices,
+)
 from .datasets import (
     build_curated_dataset,
     load_curated_dataset,
@@ -42,7 +47,7 @@ from .execution import (
     replay_event_file,
     save_paper_audit_report,
 )
-from .models import MarketData, Policy
+from .models import InstrumentMetadata, MarketData, Policy
 from .orders import build_manual_order_plan
 from .providers import DailyBarsRequest
 from .providers.akshare import AkshareEtfDailyBarsProvider
@@ -495,21 +500,42 @@ def _verify_dataset(args: argparse.Namespace) -> int:
 
 def _load_market_source(
     args: argparse.Namespace, policy: Policy
-) -> Tuple[MarketData, Path, Optional[Dict[str, Any]]]:
+) -> Tuple[
+    MarketData,
+    Path,
+    Optional[Dict[str, Any]],
+    List[InstrumentMetadata],
+    str,
+]:
     if args.dataset is None:
-        return load_prices(args.prices), args.prices, None
+        market = load_prices(args.prices)
+        return (
+            market,
+            args.prices,
+            None,
+            generated_instrument_master(market),
+            "generated_from_standalone_prices",
+        )
     dataset = load_curated_dataset(args.dataset)
     validate_strategy_scope(policy, dataset.manifest)
     return (
         dataset.market,
         dataset.directory / "prices.csv",
         dataset.manifest,
+        list(dataset.instruments.values()),
+        "curated_dataset",
     )
 
 
 def _backtest(args: argparse.Namespace) -> int:
     policy = load_policy(args.policy)
-    market, prices_path, dataset_manifest = _load_market_source(args, policy)
+    (
+        market,
+        prices_path,
+        dataset_manifest,
+        instrument_master,
+        instrument_master_source,
+    ) = _load_market_source(args, policy)
     initial_holdings = (
         load_holdings(args.initial_holdings)
         if args.initial_holdings is not None
@@ -524,6 +550,8 @@ def _backtest(args: argparse.Namespace) -> int:
         args.policy,
         prices_path,
         args.output_root,
+        instrument_master=instrument_master,
+        instrument_master_source=instrument_master_source,
         initial_holdings=initial_holdings,
         initial_holdings_path=args.initial_holdings,
         dataset_manifest=dataset_manifest,
@@ -613,7 +641,9 @@ def _run_experiment(args: argparse.Namespace) -> int:
 
 def _plan_orders(args: argparse.Namespace) -> int:
     policy = load_policy(args.policy)
-    market, prices_path, dataset_manifest = _load_market_source(args, policy)
+    market, prices_path, dataset_manifest, _, _ = _load_market_source(
+        args, policy
+    )
     if dataset_manifest is not None:
         validate_manual_planning_source(dataset_manifest)
     holdings = load_holdings(args.holdings)

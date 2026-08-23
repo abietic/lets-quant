@@ -2,11 +2,21 @@ from __future__ import annotations
 
 import csv
 import math
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
-from .models import Holding, MarketData
+from .models import Holding, InstrumentMetadata, MarketData
+
+
+INSTRUMENT_COLUMNS = {
+    "symbol",
+    "exchange",
+    "asset_type",
+    "listed_on",
+    "delisted_on",
+    "available_at",
+}
 
 
 class DataError(ValueError):
@@ -118,3 +128,124 @@ def load_holdings(path: Path) -> List[Holding]:
                 )
             holdings.append(Holding(symbol=symbol, quantity=quantity))
     return holdings
+
+
+def _instrument_date(
+    value: Any, location: str, *, allow_empty: bool = False
+) -> Optional[date]:
+    if not isinstance(value, str):
+        raise DataError(f"{location} must be YYYY-MM-DD")
+    normalized = value.strip()
+    if allow_empty and not normalized:
+        return None
+    try:
+        return date.fromisoformat(normalized)
+    except ValueError as exc:
+        raise DataError(f"{location} must be YYYY-MM-DD") from exc
+
+
+def _instrument_timestamp(
+    value: Any, location: str, *, allow_empty: bool
+) -> Optional[datetime]:
+    if not isinstance(value, str):
+        raise DataError(f"{location} must be an ISO-8601 timestamp")
+    normalized = value.strip()
+    if allow_empty and not normalized:
+        return None
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise DataError(f"{location} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise DataError(f"{location} must include a timezone")
+    return parsed
+
+
+def load_instrument_master(
+    path: Path,
+    *,
+    as_of: Optional[datetime] = None,
+    allow_missing_available_at: bool = False,
+) -> List[InstrumentMetadata]:
+    if as_of is not None and (
+        as_of.tzinfo is None or as_of.utcoffset() is None
+    ):
+        raise DataError("as_of must include a timezone")
+    instruments: List[InstrumentMetadata] = []
+    seen = set()
+    try:
+        handle = path.open(newline="", encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise DataError(f"instrument master not found: {path}") from exc
+
+    with handle:
+        reader = csv.DictReader(handle)
+        _require_header(reader.fieldnames, INSTRUMENT_COLUMNS, path)
+        for line_number, row in enumerate(reader, start=2):
+            location = f"{path}:{line_number}"
+            available_at = _instrument_timestamp(
+                row["available_at"],
+                f"{location}:available_at",
+                allow_empty=allow_missing_available_at,
+            )
+            if as_of is not None and available_at is None:
+                raise DataError(
+                    f"{location}:available_at is required for point-in-time filtering"
+                )
+            if as_of is not None and available_at is not None and available_at > as_of:
+                continue
+            symbol = row["symbol"].strip().upper()
+            exchange = row["exchange"].strip().upper()
+            asset_type = row["asset_type"].strip().upper()
+            if not symbol:
+                raise DataError(f"{location}:symbol must not be empty")
+            if symbol in seen:
+                raise DataError(f"{location}:duplicate instrument symbol")
+            if not exchange:
+                raise DataError(f"{location}:exchange must not be empty")
+            if not asset_type:
+                raise DataError(f"{location}:asset_type must not be empty")
+            seen.add(symbol)
+            listed_on = _instrument_date(
+                row["listed_on"], f"{location}:listed_on"
+            )
+            delisted_on = _instrument_date(
+                row["delisted_on"],
+                f"{location}:delisted_on",
+                allow_empty=True,
+            )
+            assert listed_on is not None
+            if delisted_on is not None and delisted_on < listed_on:
+                raise DataError(
+                    f"{location}:delisted_on is earlier than listed_on"
+                )
+            instruments.append(
+                InstrumentMetadata(
+                    symbol=symbol,
+                    exchange=exchange,
+                    asset_type=asset_type,
+                    listed_on=listed_on,
+                    delisted_on=delisted_on,
+                    available_at=available_at,
+                )
+            )
+    return sorted(instruments, key=lambda item: item.symbol)
+
+
+def generated_instrument_master(
+    market: MarketData,
+) -> List[InstrumentMetadata]:
+    first_date = market.dates[0]
+    return [
+        InstrumentMetadata(
+            symbol=symbol,
+            exchange="SYNTH",
+            asset_type="SYNTHETIC",
+            listed_on=first_date,
+            delisted_on=None,
+            available_at=None,
+        )
+        for symbol in market.symbols
+    ]

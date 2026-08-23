@@ -79,8 +79,9 @@ date,symbol,open,high,low,close,volume,amount,available_at,adjustment
 - `corporate_actions.csv`：
   `symbol,event_type,ex_date,announced_at,cash_amount,ratio,available_at`
 
-当前辅助输入会被哈希并写入数据集 manifest；后续应为交易所日历、证券主数据
-和公司行动分别增加原始快照适配器。
+当前辅助输入会被哈希并写入数据集 manifest；回测还会把规范化证券主数据复制为
+受保护快照，跨引擎候选必须提交逐标的映射。后续仍应为交易所日历、证券主数据
+和公司行动分别增加原始快照适配器；当前工程闭环不证明其供应商来源。
 
 ## 质量门禁
 

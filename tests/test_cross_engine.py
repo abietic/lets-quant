@@ -11,6 +11,7 @@ from lets_quant.cli import main
 from lets_quant.cross_engine import (
     EngineValidationError,
     file_sha256,
+    read_instrument_master_rows,
     read_nav_rows,
     read_signal_rows,
     read_trade_rows,
@@ -36,14 +37,14 @@ class CrossEngineTest(unittest.TestCase):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             args = [
-                    "backtest",
-                    "--policy",
-                    str(policy_path),
-                    "--prices",
-                    str(ROOT / "examples/prices.csv"),
-                    "--output-root",
-                    str(temporary / "reference"),
-                ]
+                "backtest",
+                "--policy",
+                str(policy_path),
+                "--prices",
+                str(ROOT / "examples/prices.csv"),
+                "--output-root",
+                str(temporary / "reference"),
+            ]
             if initial_holdings_path is not None:
                 args.extend(
                     ["--initial-holdings", str(initial_holdings_path)]
@@ -52,9 +53,41 @@ class CrossEngineTest(unittest.TestCase):
         self.assertEqual(exit_code, 0, stdout.getvalue())
         return Path(json.loads(stdout.getvalue())["artifact_directory"])
 
+    def _instrument_mapping(self, reference: Path):
+        master_rows = read_instrument_master_rows(
+            reference / "instrument_master.csv"
+        )
+        expected_symbols = set(
+            read_nav_rows(reference / "nav.csv")[0]["positions"]
+        )
+        mapping_mode = "test_identity"
+        rows = [
+            {
+                "symbol": row["symbol"],
+                "engine_symbol": row["symbol"],
+                "exchange": row["exchange"],
+                "asset_type": row["asset_type"],
+                "listed_on": row["listed_on"],
+                "delisted_on": row["delisted_on"],
+                "mapping_mode": mapping_mode,
+            }
+            for row in master_rows
+            if row["symbol"] in expected_symbols
+        ]
+        return rows, {
+            "instrument_mapping_mode": mapping_mode,
+            "instrument_master_sha256": file_sha256(
+                reference / "instrument_master.csv"
+            ),
+            "instrument_master_source": json.loads(
+                (reference / "manifest.json").read_text(encoding="utf-8")
+            )["instrument_master_source"],
+        }
+
     def _candidate_run(self, temporary: Path, reference: Path) -> Path:
         nav_rows = read_nav_rows(reference / "nav.csv")
         trade_rows = read_trade_rows(reference / "trades.csv")
+        instrument_rows, instrument_scope = self._instrument_mapping(reference)
         return write_engine_candidate(
             reference_directory=reference,
             output_root=temporary / "candidates",
@@ -70,8 +103,10 @@ class CrossEngineTest(unittest.TestCase):
                 "input": "frozen_order_intents",
                 "validated_components": ["fixture normalization"],
                 "excluded_components": ["strategy validity"],
+                **instrument_scope,
             },
             limitations=["test fixture only"],
+            instrument_mapping_rows=instrument_rows,
         )
 
     def _corporate_action_candidate_run(
@@ -83,6 +118,7 @@ class CrossEngineTest(unittest.TestCase):
     ) -> Path:
         nav_rows = read_nav_rows(reference / "nav.csv")
         trade_rows = read_trade_rows(reference / "trades.csv")
+        instrument_rows, instrument_scope = self._instrument_mapping(reference)
         action_rows = [
             {
                 "trading_date": "2025-01-07",
@@ -115,8 +151,10 @@ class CrossEngineTest(unittest.TestCase):
                 "input": "frozen_order_intents",
                 "validated_components": ["corporate action accounting"],
                 "excluded_components": ["strategy validity"],
+                **instrument_scope,
             },
             limitations=["test fixture only"],
+            instrument_mapping_rows=instrument_rows,
         )
 
     def _policy_candidate_run(
@@ -125,6 +163,7 @@ class CrossEngineTest(unittest.TestCase):
         nav_rows = read_nav_rows(reference / "nav.csv")
         trade_rows = read_trade_rows(reference / "trades.csv")
         signal_rows = read_signal_rows(reference / "signals.csv")
+        instrument_rows, instrument_scope = self._instrument_mapping(reference)
         return write_engine_candidate(
             reference_directory=reference,
             output_root=temporary / "policy-candidates",
@@ -141,8 +180,10 @@ class CrossEngineTest(unittest.TestCase):
                 "input": "independent_policy",
                 "validated_components": ["policy decisions"],
                 "excluded_components": ["market data validity"],
+                **instrument_scope,
             },
             limitations=["test fixture only"],
+            instrument_mapping_rows=instrument_rows,
         )
 
     def _refresh_candidate_identity(
@@ -180,6 +221,7 @@ class CrossEngineTest(unittest.TestCase):
     ) -> Path:
         nav_rows = read_nav_rows(reference / "nav.csv")
         trade_rows = read_trade_rows(reference / "trades.csv")
+        instrument_rows, instrument_scope = self._instrument_mapping(reference)
         order_rows = []
         event_rows = []
         sequence = 1
@@ -315,8 +357,10 @@ class CrossEngineTest(unittest.TestCase):
                 "input": "frozen_order_intents",
                 "validated_components": ["native order lifecycle"],
                 "excluded_components": ["strategy validity"],
+                **instrument_scope,
             },
             limitations=["test fixture only"],
+            instrument_mapping_rows=instrument_rows,
         )
 
     def test_identical_candidate_passes_and_cli_writes_report(self) -> None:
@@ -613,6 +657,31 @@ class CrossEngineTest(unittest.TestCase):
                 "reference artifact integrity failed for initial_holdings.csv",
             ):
                 reconcile_engine_candidate(reference, candidate)
+
+    def test_hash_consistent_instrument_metadata_drift_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            reference = self._reference_run(temporary)
+            candidate = self._candidate_run(temporary, reference)
+            mapping_path = candidate / "instrument_mapping.csv"
+            mapping_path.write_text(
+                mapping_path.read_text(encoding="utf-8").replace(
+                    ",SYNTH,SYNTHETIC,", ",WRONG,SYNTHETIC,", 1
+                ),
+                encoding="utf-8",
+            )
+            self._refresh_candidate_identity(
+                candidate, "instrument_mapping.csv"
+            )
+
+            report = reconcile_engine_candidate(reference, candidate)
+
+            self.assertEqual(report["status"], "blocked")
+            checks = {check["name"]: check for check in report["checks"]}
+            self.assertEqual(checks["instrument_mapping"]["status"], "blocked")
+            self.assertEqual(
+                checks["candidate_file_integrity"]["status"], "pass"
+            )
 
     def test_candidate_bound_to_another_intact_run_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
