@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+.venv-vectorbt/
 .env
 .env.*
 !.env.example
@@ -16,5 +17,6 @@ artifacts/runs/
 artifacts/plans/
 artifacts/experiments/
 artifacts/paper/
+artifacts/engine-validation/
 data/raw/
 data/curated/

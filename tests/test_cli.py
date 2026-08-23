@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import json
 import tempfile
@@ -52,6 +53,16 @@ class CliTest(unittest.TestCase):
                 )
             )
             self.assertEqual(len(manifest["source_tree_sha256"]), 64)
+            self.assertEqual(
+                set(manifest["file_sha256"]), files - {"manifest.json"}
+            )
+            for name, expected_hash in manifest["file_sha256"].items():
+                self.assertEqual(
+                    hashlib.sha256(
+                        (run_directories[0] / name).read_bytes()
+                    ).hexdigest(),
+                    expected_hash,
+                )
 
     def test_example_order_plan_is_reviewable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

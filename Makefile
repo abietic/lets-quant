@@ -1,7 +1,7 @@
 PYTHON ?= python3
 PYTHONPATH := $(CURDIR)/src
 
-.PHONY: check compile lint test validate demo plan m1-validate m1-demo m15-demo m2-demo paper-demo paper-audit-demo
+.PHONY: check compile lint test validate demo plan m1-validate m1-demo m15-demo m2-demo paper-demo paper-audit-demo vectorbt-test vectorbt-demo
 
 check: compile test
 
@@ -9,7 +9,7 @@ compile:
 	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m compileall -q src tests
 
 lint:
-	$(PYTHON) -m ruff check --select E,F src tests
+	$(PYTHON) -m ruff check --target-version py39 --select E,F src tests
 
 test:
 	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m unittest discover -s tests -v
@@ -92,3 +92,18 @@ paper-audit-demo:
 		--state "$$state_path" \
 		--audit-input examples/paper/audit_input.json \
 		--report-out artifacts/paper/audit-demo-report.json
+
+vectorbt-test:
+	$(PYTHON) -c 'import vectorbt; assert vectorbt.__version__ == "1.1.0"'
+	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m unittest \
+		tests.test_vectorbt_adapter -v
+
+vectorbt-demo:
+	@set -eu; \
+	reference_dir="$$(PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant backtest \
+		--policy config/policy.example.json \
+		--prices examples/prices.csv \
+		| $(PYTHON) -c 'import json,sys; print(json.load(sys.stdin)["artifact_directory"])')"; \
+	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant validate-vectorbt \
+		--reference-run "$$reference_dir" \
+		--prices examples/prices.csv

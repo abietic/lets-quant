@@ -14,6 +14,11 @@ from .artifacts import (
 )
 from .backtest import run_backtest
 from .config import PolicyError, load_policy
+from .cross_engine import (
+    EngineValidationError,
+    reconcile_engine_candidate,
+    write_reconciliation_report,
+)
 from .data import DataError, load_holdings, load_prices
 from .datasets import (
     build_curated_dataset,
@@ -48,6 +53,7 @@ from .scenarios import (
 )
 from .snapshots import save_snapshot_bytes, snapshot_file
 from .strategies import StrategyError
+from .vectorbt_adapter import run_vectorbt_validation
 
 
 def _date_argument(value: str) -> date:
@@ -206,6 +212,46 @@ def build_parser() -> argparse.ArgumentParser:
     paper_audit.add_argument("--state", type=Path, required=True)
     paper_audit.add_argument("--audit-input", type=Path, required=True)
     paper_audit.add_argument("--report-out", type=Path, required=True)
+
+    vectorbt_validation = subcommands.add_parser(
+        "validate-vectorbt",
+        help=(
+            "replay frozen order intents in VectorBT and reconcile artifacts"
+        ),
+    )
+    vectorbt_validation.add_argument(
+        "--reference-run", type=Path, required=True
+    )
+    vectorbt_validation.add_argument(
+        "--prices",
+        type=Path,
+        help="price CSV; defaults to the path bound by the reference manifest",
+    )
+    vectorbt_validation.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("artifacts/engine-validation"),
+    )
+    vectorbt_validation.add_argument(
+        "--money-tolerance", type=float, default=1e-6
+    )
+    vectorbt_validation.add_argument(
+        "--ratio-tolerance", type=float, default=1e-10
+    )
+
+    reconcile_engine = subcommands.add_parser(
+        "reconcile-engine",
+        help="reconcile a normalized independent-engine candidate",
+    )
+    reconcile_engine.add_argument("--reference-run", type=Path, required=True)
+    reconcile_engine.add_argument("--candidate-run", type=Path, required=True)
+    reconcile_engine.add_argument("--report-out", type=Path, required=True)
+    reconcile_engine.add_argument(
+        "--money-tolerance", type=float, default=1e-6
+    )
+    reconcile_engine.add_argument(
+        "--ratio-tolerance", type=float, default=1e-10
+    )
     return parser
 
 
@@ -607,6 +653,59 @@ def _audit_paper_state(args: argparse.Namespace) -> int:
     return 3 if report["status"] == "blocked" else 0
 
 
+def _validate_vectorbt(args: argparse.Namespace) -> int:
+    destination, report = run_vectorbt_validation(
+        reference_directory=args.reference_run,
+        prices_path=args.prices,
+        output_root=args.output_root,
+        money_tolerance=args.money_tolerance,
+        ratio_tolerance=args.ratio_tolerance,
+    )
+    print(
+        json.dumps(
+            {
+                "status": report["status"],
+                "candidate_directory": str(destination.resolve()),
+                "report_path": str(
+                    (destination / "reconciliation.json").resolve()
+                ),
+                "report_sha256": report["report_sha256"],
+                "summary": report["summary"],
+                "investment_validity_established": False,
+                "automatic_execution_allowed": False,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0 if report["status"] == "pass" else 3
+
+
+def _reconcile_engine(args: argparse.Namespace) -> int:
+    report = reconcile_engine_candidate(
+        args.reference_run,
+        args.candidate_run,
+        money_tolerance=args.money_tolerance,
+        ratio_tolerance=args.ratio_tolerance,
+    )
+    write_reconciliation_report(report, args.report_out)
+    print(
+        json.dumps(
+            {
+                "status": report["status"],
+                "report_path": str(args.report_out.resolve()),
+                "report_sha256": report["report_sha256"],
+                "summary": report["summary"],
+                "investment_validity_established": False,
+                "automatic_execution_allowed": False,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0 if report["status"] == "pass" else 3
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -633,8 +732,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _replay_paper_events(args)
         if args.command == "audit-paper-state":
             return _audit_paper_state(args)
+        if args.command == "validate-vectorbt":
+            return _validate_vectorbt(args)
+        if args.command == "reconcile-engine":
+            return _reconcile_engine(args)
     except (
         DataError,
+        EngineValidationError,
         ExperimentError,
         PaperAuditError,
         PaperExecutionError,

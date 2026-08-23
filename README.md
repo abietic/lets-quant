@@ -17,6 +17,8 @@
 - 带原始快照、清洗数据集和配置哈希的回测产物。
 - train/validation/test 时间隔离、成本与成交延迟压力实验。
 - 多个滚动时间折和邻近策略参数敏感性矩阵，不自动选择最优参数。
+- 带严格输入指纹和差异报告的跨引擎候选产物契约与对账器。
+- 可选 VectorBT 1.1.0 适配器，规则 lowering 后复核成交、费用、持仓和 NAV。
 - 六类确定性合成市场，用于验证软件语义和失败边界。
 - 显式现金/持仓账本、公司行动入账和每日资产恒等式校验。
 - 可持久化的离线 paper 订单状态机、事件幂等和重启恢复。
@@ -42,6 +44,15 @@ make m15-demo
 make m2-demo
 make paper-demo
 make paper-audit-demo
+```
+
+核心命令仍是零运行时依赖。跨引擎适配器需要 Python 3.11+ 的独立环境：
+
+```bash
+python3.13 -m venv .venv-vectorbt
+source .venv-vectorbt/bin/activate
+python -m pip install -e '.[vectorbt]'
+make vectorbt-test vectorbt-demo
 ```
 
 `make m1-demo` 使用短小的合成行情跑通“原始快照 -> point-in-time
@@ -80,7 +91,7 @@ PYTHONPATH=src python3 -m lets_quant backtest \
 
 `backtest` 会在 `artifacts/runs/<run-id>/` 中生成：
 
-- `manifest.json`：输入路径、SHA-256、源码版本、Python 版本和模型假设。
+- `manifest.json`：输入路径、逐文件 SHA-256、源码版本、Python 版本和模型假设。
 - `policy.snapshot.json`：本次运行使用的完整策略快照。
 - `metrics.json`：收益、波动、夏普、回撤、费用、换手率和基准指标。
 - `nav.csv`：每日净值、现金、持仓和风险冻结状态。
@@ -153,6 +164,29 @@ make m2-demo
 场景”展示各参数变体的 test 收益范围，并按变体汇总最差、最好和平均结果。
 这些统计只描述敏感性，`automatic_parameter_selection` 和
 `model_refit_per_fold` 都明确为 `false`；不能把表现最好的变体倒推成已验证策略。
+
+## M2 跨引擎执行对账
+
+`validate-vectorbt` 不读取参考成交来生成候选结果。它读取冻结的订单意图和绑定
+哈希的原始价格。适配器将动态现金缓冲、卖出优先、整手、佣金、最低佣金、
+卖出税和滑点映射成 VectorBT 订单，再由 VectorBT 独立生成共享现金、持仓、NAV
+和订单记录，最后逐项核对：
+
+```bash
+PYTHONPATH=src python -m lets_quant validate-vectorbt \
+  --reference-run artifacts/runs/<run-id> \
+  --prices examples/prices.csv
+```
+
+候选目录包含带 SHA-256 的 manifest、规范化 NAV、成交、指标和
+`reconciliation.json`。任何输入漂移、文件篡改、数量/状态差异或超过容差的数值
+偏差都会进入 `blocked`，命令返回退出码 `3`。
+
+当前只独立验证 lowering 后的组合会计，不独立生成策略信号，也不独立证明动态
+现金缓冲下的可买数量公式；只支持独立 CSV、零初始持仓、只做多日线运行，清洗
+数据集中的停牌和公司行动会 fail closed。
+完整契约与扩展方法见
+[跨引擎验证](docs/CROSS_ENGINE_VALIDATION.md)。
 
 ## 显式会计与公司行动
 

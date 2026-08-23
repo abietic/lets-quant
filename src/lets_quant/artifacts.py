@@ -328,6 +328,11 @@ def write_backtest_artifacts(
     ]
     if dataset_manifest is not None:
         files.append("dataset.snapshot.json")
+    file_sha256 = {
+        name: _file_sha256(destination / name)
+        for name in files
+        if name != "manifest.json"
+    }
 
     manifest: Dict[str, Any] = {
         "artifact_type": "backtest",
@@ -362,6 +367,7 @@ def write_backtest_artifacts(
             else {"type": "standalone_prices_csv"}
         ),
         "files": sorted(files),
+        "file_sha256": file_sha256,
     }
     _write_json(destination / "manifest.json", manifest)
     return destination
