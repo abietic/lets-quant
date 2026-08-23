@@ -154,6 +154,23 @@ class ExperimentTest(unittest.TestCase):
         self.assertFalse(
             result.summary["walk_forward"]["model_refit_per_fold"]
         )
+        regime_summary = result.summary["test_market_regime_attribution"]
+        self.assertTrue(regime_summary["enabled"])
+        self.assertTrue(regime_summary["descriptive_only"])
+        self.assertFalse(regime_summary["used_for_parameter_selection"])
+        self.assertEqual(regime_summary["test_case_count"], 8)
+        self.assertEqual(regime_summary["comparison_count"], 20)
+        self.assertTrue(
+            all(
+                abs(
+                    case.regime_attribution.to_summary()[
+                        "strategy_reconciliation_error"
+                    ]
+                )
+                < 1e-12
+                for case in result.cases
+            )
+        )
 
     def test_walk_forward_test_windows_must_advance(self) -> None:
         raw = json.loads(
@@ -208,6 +225,32 @@ class ExperimentTest(unittest.TestCase):
             ExperimentError, "cannot override momentum"
         ):
             run_experiment(spec, policy, market)
+
+    def test_experiment_without_benchmark_disables_regime_attribution(
+        self,
+    ) -> None:
+        spec = load_experiment_spec(
+            ROOT / "config/experiment.m1_5.example.json"
+        )
+        market = generate_synthetic_market(
+            "regime_shift",
+            start_date=date(2022, 1, 3),
+            trading_days=780,
+            symbols=["ASSET_A", "ASSET_B"],
+            benchmark=None,
+            seed=spec.seed,
+        ).market
+        policy = make_policy(
+            weights={"ASSET_A": 0.5, "ASSET_B": 0.4},
+            rebalance_every=20,
+        )
+
+        result = run_experiment(spec, policy, market)
+        summary = result.summary["test_market_regime_attribution"]
+
+        self.assertFalse(summary["enabled"])
+        self.assertEqual(summary["test_case_count"], 3)
+        self.assertEqual(summary["comparison_count"], 0)
 
 
 if __name__ == "__main__":

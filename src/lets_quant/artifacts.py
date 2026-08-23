@@ -565,8 +565,61 @@ def write_experiment_artifacts(
                 "window": case.window.to_dict(),
                 "execution_scenario": case.execution_scenario.to_dict(),
                 "parameter_variant": case.parameter_variant.to_dict(),
+                "market_regime_attribution": (
+                    case.regime_attribution.to_summary()
+                ),
                 "experiment_result_sha256": result.result_sha256,
             },
+        )
+        _write_csv(
+            case_directory / "regime_attribution.csv",
+            (
+                {
+                    "date": row.trading_date.isoformat(),
+                    "information_cutoff_date": (
+                        row.information_cutoff_date.isoformat()
+                        if row.information_cutoff_date is not None
+                        else ""
+                    ),
+                    "regime": row.regime,
+                    "trailing_benchmark_return": (
+                        format(row.trailing_benchmark_return, ".17g")
+                        if row.trailing_benchmark_return is not None
+                        else ""
+                    ),
+                    "trailing_benchmark_drawdown": (
+                        format(row.trailing_benchmark_drawdown, ".17g")
+                        if row.trailing_benchmark_drawdown is not None
+                        else ""
+                    ),
+                    "strategy_return": format(row.strategy_return, ".17g"),
+                    "benchmark_return": format(
+                        row.benchmark_return, ".17g"
+                    ),
+                    "strategy_log_return": format(
+                        row.strategy_log_return, ".17g"
+                    ),
+                    "benchmark_log_return": format(
+                        row.benchmark_log_return, ".17g"
+                    ),
+                    "excess_log_return": format(
+                        row.excess_log_return, ".17g"
+                    ),
+                }
+                for row in case.regime_attribution.observations
+            ),
+            [
+                "date",
+                "information_cutoff_date",
+                "regime",
+                "trailing_benchmark_return",
+                "trailing_benchmark_drawdown",
+                "strategy_return",
+                "benchmark_return",
+                "strategy_log_return",
+                "benchmark_log_return",
+                "excess_log_return",
+            ],
         )
         _write_backtest_result_files(case_directory, case.result)
 

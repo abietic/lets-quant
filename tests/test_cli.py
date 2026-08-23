@@ -313,6 +313,18 @@ class CliTest(unittest.TestCase):
             self.assertTrue(
                 all((case / "ledger.csv").exists() for case in case_directories)
             )
+            self.assertTrue(
+                all(
+                    (case / "regime_attribution.csv").exists()
+                    for case in case_directories
+                )
+            )
+            summary = json.loads(
+                (experiment_directory / "summary.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(summary["test_market_regime_attribution"]["enabled"])
 
     def test_paper_event_replay_is_restart_safe(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

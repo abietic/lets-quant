@@ -12,6 +12,13 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 from .backtest import run_backtest
 from .config import PolicyError, validate_policy
 from .models import BacktestResult, MarketData, Policy
+from .regimes import (
+    DEFAULT_REGIME_PROTOCOL,
+    REGIME_NAMES,
+    RegimeAttribution,
+    RegimeAttributionError,
+    attribute_market_regimes,
+)
 
 
 class ExperimentError(ValueError):
@@ -98,6 +105,7 @@ class ExperimentCaseResult:
     execution_scenario: ExecutionScenario
     parameter_variant: ParameterVariant
     result: BacktestResult
+    regime_attribution: RegimeAttribution
 
 
 @dataclass(frozen=True)
@@ -604,6 +612,7 @@ def _case_summary(case: ExperimentCaseResult) -> Dict[str, Any]:
         ),
         "decision_count": metrics["decision_count"],
         "filled_trade_count": metrics["filled_trade_count"],
+        "market_regime_attribution": case.regime_attribution.to_summary(),
     }
 
 
@@ -670,6 +679,151 @@ def _parameter_stability_summary(
     }
 
 
+def _test_market_regime_summary(
+    cases: Sequence[ExperimentCaseResult],
+) -> Dict[str, Any]:
+    if not cases:
+        raise ExperimentError("market-regime summary requires experiment cases")
+    attributions = [case.regime_attribution for case in cases]
+    enabled_values = {attribution.enabled for attribution in attributions}
+    if len(enabled_values) != 1:
+        raise ExperimentError(
+            "market-regime attribution must be consistently enabled"
+        )
+    first = attributions[0]
+    base = {
+        "enabled": first.enabled,
+        "benchmark": first.benchmark,
+        "protocol": first.protocol.to_dict(),
+        "descriptive_only": True,
+        "used_for_strategy_decisions": False,
+        "used_for_parameter_selection": False,
+        "pooled_performance_estimate": False,
+        "aggregation_unit": "per-case log-return contribution",
+    }
+    test_cases = [case for case in cases if case.window.role == "test"]
+    if not first.enabled:
+        return {
+            **base,
+            "disabled_reason": first.disabled_reason,
+            "test_case_count": len(test_cases),
+            "comparison_count": 0,
+            "comparisons": [],
+        }
+    if any(
+        attribution.benchmark != first.benchmark
+        or attribution.protocol != first.protocol
+        for attribution in attributions
+    ):
+        raise ExperimentError(
+            "market-regime attribution protocol changed within an experiment"
+        )
+
+    grouped: Dict[
+        tuple[str, str, str], List[tuple[ExperimentCaseResult, Dict[str, Any]]]
+    ] = {}
+    for case in test_cases:
+        by_regime = {
+            row["regime"]: row
+            for row in case.regime_attribution.regime_summaries()
+        }
+        for regime in REGIME_NAMES:
+            key = (
+                case.execution_scenario.name,
+                case.parameter_variant.name,
+                regime,
+            )
+            grouped.setdefault(key, []).append((case, by_regime[regime]))
+
+    comparisons: List[Dict[str, Any]] = []
+    execution_order = {
+        name: index
+        for index, name in enumerate(
+            dict.fromkeys(case.execution_scenario.name for case in test_cases)
+        )
+    }
+    parameter_order = {
+        name: index
+        for index, name in enumerate(
+            dict.fromkeys(case.parameter_variant.name for case in test_cases)
+        )
+    }
+    regime_order = {name: index for index, name in enumerate(REGIME_NAMES)}
+    ordered_keys = sorted(
+        grouped,
+        key=lambda item: (
+            execution_order[item[0]],
+            parameter_order[item[1]],
+            regime_order[item[2]],
+        ),
+    )
+    for key in ordered_keys:
+        execution_scenario, parameter_variant, regime = key
+        group = grouped[key]
+        strategy_values = [
+            row["strategy_log_return_contribution"] for _, row in group
+        ]
+        benchmark_values = [
+            row["benchmark_log_return_contribution"] for _, row in group
+        ]
+        excess_values = [
+            row["excess_log_return_contribution"] for _, row in group
+        ]
+        comparisons.append(
+            {
+                "execution_scenario": execution_scenario,
+                "parameter_variant": parameter_variant,
+                "regime": regime,
+                "case_count": len(group),
+                "fold_count": len({case.window.fold for case, _ in group}),
+                "observed_case_count": sum(
+                    1 for _, row in group if row["day_count"] > 0
+                ),
+                "total_day_count": sum(row["day_count"] for _, row in group),
+                "minimum_strategy_log_return_contribution": min(
+                    strategy_values
+                ),
+                "maximum_strategy_log_return_contribution": max(
+                    strategy_values
+                ),
+                "mean_strategy_log_return_contribution": statistics.mean(
+                    strategy_values
+                ),
+                "mean_benchmark_log_return_contribution": statistics.mean(
+                    benchmark_values
+                ),
+                "mean_excess_log_return_contribution": statistics.mean(
+                    excess_values
+                ),
+                "positive_strategy_contribution_case_count": sum(
+                    1 for value in strategy_values if value > 0
+                ),
+            }
+        )
+
+    unique_windows = sorted(
+        {
+            (case.window.fold, case.window.start, case.window.end)
+            for case in test_cases
+        },
+        key=lambda item: (item[1], item[2], item[0]),
+    )
+    overlapping_windows = any(
+        first_window[1] <= second_window[2]
+        and second_window[1] <= first_window[2]
+        for index, first_window in enumerate(unique_windows)
+        for second_window in unique_windows[index + 1 :]
+    )
+    return {
+        **base,
+        "test_case_count": len(test_cases),
+        "test_window_count": len(unique_windows),
+        "test_windows_overlap": overlapping_windows,
+        "comparison_count": len(comparisons),
+        "comparisons": comparisons,
+    }
+
+
 def run_experiment(
     spec: ExperimentSpec, policy: Policy, market: MarketData
 ) -> ExperimentResult:
@@ -677,6 +831,7 @@ def run_experiment(
         "spec": spec.to_dict(),
         "policy": policy.to_dict(),
         "market_sha256": _sha256_json(market_identity(market)),
+        "regime_protocol": DEFAULT_REGIME_PROTOCOL.to_dict(),
     }
     experiment_input_id = _sha256_json(input_payload)
     cases: List[ExperimentCaseResult] = []
@@ -696,6 +851,17 @@ def run_experiment(
                     start_date=window.start,
                     end_date=window.end,
                 )
+                try:
+                    regime_attribution = attribute_market_regimes(
+                        market,
+                        policy.portfolio.benchmark,
+                        result.nav,
+                        protocol=DEFAULT_REGIME_PROTOCOL,
+                    )
+                except RegimeAttributionError as exc:
+                    raise ExperimentError(
+                        f"market-regime attribution failed: {exc}"
+                    ) from exc
                 case_id = _sha256_json(
                     {
                         "experiment_input_id": experiment_input_id,
@@ -711,6 +877,7 @@ def run_experiment(
                         execution_scenario=execution_scenario,
                         parameter_variant=parameter_variant,
                         result=result,
+                        regime_attribution=regime_attribution,
                     )
                 )
 
@@ -751,6 +918,7 @@ def run_experiment(
         "test_parameter_stability": _parameter_stability_summary(
             spec, cases
         ),
+        "test_market_regime_attribution": _test_market_regime_summary(cases),
     }
     result_sha256 = _sha256_json(
         {
@@ -762,6 +930,7 @@ def run_experiment(
                     "execution_scenario": case.execution_scenario.to_dict(),
                     "parameter_variant": case.parameter_variant.to_dict(),
                     "result": case.result,
+                    "regime_attribution": case.regime_attribution,
                 }
                 for case in cases
             ],
