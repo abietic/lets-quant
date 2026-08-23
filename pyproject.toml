@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lets-quant"
+version = "0.5.0"
+description = "A local-first, research-only personal quantitative investing toolkit"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+  { name = "lets-quant contributors" },
+]
+dependencies = []
+
+[project.optional-dependencies]
+akshare = ["akshare==1.18.79"]
+
+[project.scripts]
+lets-quant = "lets_quant.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

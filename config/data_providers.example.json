@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "providers": {
+    "akshare": {
+      "display_name": "AKShare",
+      "library_license": "MIT",
+      "data_rights": "upstream-source-specific; not granted by the library license",
+      "allowed_use": [
+        "personal_research"
+      ],
+      "redistribution": "not_assessed",
+      "source_url": "https://github.com/akfamily/akshare",
+      "terms_url": null,
+      "notes": "Research adapter only. Verify each upstream source's terms before redistribution or commercial use."
+    },
+    "local_csv": {
+      "display_name": "User supplied local CSV",
+      "library_license": null,
+      "data_rights": "user-attested",
+      "allowed_use": [
+        "personal_research"
+      ],
+      "redistribution": "not_assessed",
+      "source_url": null,
+      "terms_url": null,
+      "notes": "The user is responsible for recording the real origin and rights of imported files."
+    }
+  }
+}

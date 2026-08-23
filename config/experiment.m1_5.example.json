@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "name": "m1.5-offline-robustness-demo",
+  "seed": 20260820,
+  "windows": [
+    {
+      "name": "development",
+      "role": "train",
+      "start": "2022-01-03",
+      "end": "2023-06-30"
+    },
+    {
+      "name": "model-selection-freeze",
+      "role": "validation",
+      "start": "2023-07-03",
+      "end": "2023-12-29"
+    },
+    {
+      "name": "untouched-evaluation",
+      "role": "test",
+      "start": "2024-01-01",
+      "end": "2024-12-27"
+    }
+  ],
+  "execution_scenarios": [
+    {
+      "name": "configured-costs"
+    },
+    {
+      "name": "high-friction",
+      "commission_rate": 0.001,
+      "minimum_commission": 8,
+      "sell_tax_rate": 0.001,
+      "slippage_bps": 20
+    },
+    {
+      "name": "delayed-execution",
+      "execution_delay_trading_days": 3,
+      "slippage_bps": 10
+    }
+  ]
+}

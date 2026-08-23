@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "name": "synthetic-momentum-filter-demo",
+  "base_currency": "CNY",
+  "strategy": {
+    "kind": "momentum_filter",
+    "target_weights": {
+      "ASSET_A": 0.45,
+      "ASSET_B": 0.45
+    },
+    "rebalance_every_n_trading_days": 20,
+    "lookback_trading_days": 60,
+    "minimum_momentum": 0
+  },
+  "portfolio": {
+    "initial_cash": 100000,
+    "benchmark": "BENCH",
+    "cash_buffer_weight": 0.1
+  },
+  "execution": {
+    "mode": "paper",
+    "lot_size": 100,
+    "commission_rate": 0.0003,
+    "minimum_commission": 5,
+    "sell_tax_rate": 0.0005,
+    "slippage_bps": 5
+  },
+  "risk": {
+    "max_single_weight": 0.5,
+    "max_gross_exposure": 0.9,
+    "max_turnover_per_rebalance": 1.0,
+    "max_drawdown": 0.25
+  }
+}

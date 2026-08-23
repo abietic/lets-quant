@@ -1,0 +1,71 @@
+{
+  "schema_version": 2,
+  "name": "m2-rolling-parameter-stability-demo",
+  "seed": 20260820,
+  "windows": [
+    {
+      "name": "fold-1-development",
+      "role": "train",
+      "start": "2022-01-03",
+      "end": "2022-12-30",
+      "fold": "fold-1"
+    },
+    {
+      "name": "fold-1-selection-freeze",
+      "role": "validation",
+      "start": "2023-01-02",
+      "end": "2023-06-30",
+      "fold": "fold-1"
+    },
+    {
+      "name": "fold-1-evaluation",
+      "role": "test",
+      "start": "2023-07-03",
+      "end": "2023-12-29",
+      "fold": "fold-1"
+    },
+    {
+      "name": "fold-2-development",
+      "role": "train",
+      "start": "2022-07-01",
+      "end": "2023-06-30",
+      "fold": "fold-2"
+    },
+    {
+      "name": "fold-2-selection-freeze",
+      "role": "validation",
+      "start": "2023-07-03",
+      "end": "2023-12-29",
+      "fold": "fold-2"
+    },
+    {
+      "name": "fold-2-evaluation",
+      "role": "test",
+      "start": "2024-01-01",
+      "end": "2024-12-27",
+      "fold": "fold-2"
+    }
+  ],
+  "execution_scenarios": [
+    {
+      "name": "configured-costs"
+    }
+  ],
+  "parameter_variants": [
+    {
+      "name": "configured"
+    },
+    {
+      "name": "shorter-lookback",
+      "lookback_trading_days": 40
+    },
+    {
+      "name": "longer-lookback",
+      "lookback_trading_days": 80
+    },
+    {
+      "name": "stricter-momentum",
+      "minimum_momentum": 0.02
+    }
+  ]
+}

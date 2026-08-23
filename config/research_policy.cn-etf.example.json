@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "name": "cn-etf-daily-research-example",
+  "purpose": "research_only",
+  "market": "CN",
+  "base_currency": "CNY",
+  "bar_frequency": "daily",
+  "adjustment": "hfq",
+  "point_in_time_mode": "provider_publication",
+  "horizon": {
+    "start_date": "2018-01-01",
+    "minimum_history_trading_days": 756,
+    "decision_frequency": "monthly"
+  },
+  "benchmark": "510300.XSHG",
+  "max_drawdown": 0.15,
+  "instruments": [
+    {
+      "symbol": "510300.XSHG",
+      "exchange": "XSHG",
+      "asset_type": "ETF",
+      "roles": [
+        "tradable",
+        "benchmark"
+      ]
+    },
+    {
+      "symbol": "511010.XSHG",
+      "exchange": "XSHG",
+      "asset_type": "ETF",
+      "roles": [
+        "tradable"
+      ]
+    }
+  ]
+}

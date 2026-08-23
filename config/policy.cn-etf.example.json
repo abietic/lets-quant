@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "name": "cn-etf-engineering-example",
+  "base_currency": "CNY",
+  "strategy": {
+    "kind": "fixed_weight",
+    "target_weights": {
+      "510300.XSHG": 0.6,
+      "511010.XSHG": 0.3
+    },
+    "rebalance_every_n_trading_days": 20
+  },
+  "portfolio": {
+    "initial_cash": 100000,
+    "benchmark": "510300.XSHG",
+    "cash_buffer_weight": 0.1
+  },
+  "execution": {
+    "mode": "manual",
+    "lot_size": 100,
+    "commission_rate": 0.0003,
+    "minimum_commission": 5,
+    "sell_tax_rate": 0,
+    "slippage_bps": 3
+  },
+  "risk": {
+    "max_single_weight": 0.65,
+    "max_gross_exposure": 0.9,
+    "max_turnover_per_rebalance": 1.0,
+    "max_drawdown": 0.15
+  }
+}

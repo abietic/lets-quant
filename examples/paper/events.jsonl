@@ -1,0 +1,9 @@
+{"event_id":"evt-001","type":"submit","occurred_at":"2025-01-02T09:30:00+08:00","client_order_id":"paper-buy-001","symbol":"ASSET_A","side":"BUY","quantity":100}
+{"event_id":"evt-002","type":"acknowledge","occurred_at":"2025-01-02T09:30:01+08:00","client_order_id":"paper-buy-001","venue_order_id":"venue-001"}
+{"event_id":"evt-003","type":"fill","occurred_at":"2025-01-02T09:31:00+08:00","client_order_id":"paper-buy-001","fill_id":"fill-001","quantity":40,"price":10,"commission":1}
+{"event_id":"evt-004","type":"fill","occurred_at":"2025-01-02T09:32:00+08:00","client_order_id":"paper-buy-001","fill_id":"fill-002","quantity":60,"price":11,"commission":1}
+{"event_id":"evt-005","type":"submit","occurred_at":"2025-01-03T09:30:00+08:00","client_order_id":"paper-sell-001","symbol":"ASSET_A","side":"SELL","quantity":20}
+{"event_id":"evt-006","type":"acknowledge","occurred_at":"2025-01-03T09:30:01+08:00","client_order_id":"paper-sell-001","venue_order_id":"venue-002"}
+{"event_id":"evt-007","type":"fill","occurred_at":"2025-01-03T09:31:00+08:00","client_order_id":"paper-sell-001","fill_id":"fill-003","quantity":20,"price":12,"commission":1,"tax":0.12}
+{"event_id":"evt-008","type":"submit","occurred_at":"2025-01-03T10:00:00+08:00","client_order_id":"paper-buy-002","symbol":"ASSET_B","side":"BUY","quantity":100}
+{"event_id":"evt-009","type":"reject","occurred_at":"2025-01-03T10:00:01+08:00","client_order_id":"paper-buy-002","reason":"offline risk fixture rejection"}
