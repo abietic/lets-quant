@@ -20,6 +20,7 @@
 - train/validation/test 时间隔离、成本与成交延迟压力实验。
 - 多个滚动时间折和邻近策略参数敏感性矩阵，不自动选择最优参数。
 - 基于前一交易日基准历史的冻结市场阶段标签、逐日证据和对数收益归因。
+- 仅用于 test 窗口的确定性移动块 bootstrap 收益区间，策略与基准配对重采样。
 - 带严格输入指纹和差异报告的跨引擎候选产物契约与对账器。
 - 可选 VectorBT 1.1.0 适配器，消费独立 CSV 或清洗数据集，复核停牌拒绝、成交、
   企业行动回调、费用、持仓和 NAV。
@@ -163,14 +164,15 @@ train、validation、test 窗口，可以定义多组佣金、税费、滑点和
 
 实验产物位于 `artifacts/experiments/<run-id>/`：
 
-- 根目录保存实验、策略、市场来源快照、输入 ID 和结果 SHA-256。
+- 根目录保存实验、策略、市场来源快照、输入 ID、结果 SHA-256 和逐文件校验和。
 - `summary.json` 汇总各窗口、执行场景和市场阶段，但显式标记不构成投资有效性
   证明。
-- `cases/` 保存每个案例的指标、净值、决策证据、成交记录和逐日
-  `regime_attribution.csv`。
+- `cases/` 保存每个案例的指标、净值、决策证据、成交记录、逐日
+  `regime_attribution.csv` 和 `bootstrap_uncertainty.json`。
 
-相同策略、实验定义、市场和源码应产生相同 `experiment_input_id` 与
-`result_sha256`。目录时间戳可以不同，这两个摘要才是重放核对依据。
+相同策略、实验定义、市场、源码和 Python 次版本应产生相同
+`experiment_input_id` 与 `result_sha256`。目录时间戳可以不同，这两个摘要才是
+同运行时重放的核对依据；跨 Python 次版本比较还应读取 manifest 中的运行时版本。
 
 ## M2 参数稳定性实验
 
@@ -193,6 +195,13 @@ make m2-demo
 test 摘要按执行场景、参数变体和阶段跨折比较，但不合并重叠窗口，也不参与策略
 决策或自动选参。无基准策略会显式禁用归因。完整契约见
 [市场阶段归因](docs/MARKET_REGIME_ATTRIBUTION.md)。
+
+test case 还使用 bootstrap protocol v1 对日对数收益做确定性循环移动块重采样：
+固定 20 日块长、1000 次样本、95% 分位区间和至少 60 个日收益观测。策略与基准
+共用每个块的索引，并报告策略收益、基准收益和策略相对基准财富变化；训练与验证
+窗口明确禁用。跨折摘要只比较各 case 区间边界，不拼接或池化窗口，也不输出
+`p-value`。无基准时仍可计算策略区间。完整契约见
+[Bootstrap 不确定性](docs/BOOTSTRAP_UNCERTAINTY.md)。
 
 ## M2 跨引擎执行对账
 
@@ -402,6 +411,8 @@ AKShare 的 MIT 许可是代码许可，不等于其上游行情的再分发或�
 - 实验中的成交延迟只是日线压力参数，不模拟真实排队位置或部分成交概率。
 - 当前滚动时间折会在每个窗口重置组合，但不会训练或拟合模型；它是时间稳定性
   检查，不是机器学习意义上的完整 walk-forward retraining。
+- bootstrap 区间依赖收益过程在局部可重采样的假设和固定 20 日块长；它不是未来
+  收益预测区间，也不能消除数据偏差、策略选择偏差或测试窗口重叠。
 
 当前已经接入 RQAlpha 作为第二个事件驱动验证引擎；使用真实资金前仍需在目标
 券商回测和模拟环境核对订单、成交、持仓及恢复真相源。
@@ -411,6 +422,7 @@ AKShare 的 MIT 许可是代码许可，不等于其上游行情的再分发或�
 - [架构和安全不变量](docs/ARCHITECTURE.md)
 - [分阶段路线图](docs/ROADMAP.md)
 - [M1 数据管道](docs/DATA_PIPELINE.md)
+- [Bootstrap 不确定性](docs/BOOTSTRAP_UNCERTAINTY.md)
 - [跨引擎验证](docs/CROSS_ENGINE_VALIDATION.md)
 - [离线 Paper 运营审计](docs/PAPER_OPERATIONS.md)
 

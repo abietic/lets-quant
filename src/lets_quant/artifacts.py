@@ -568,8 +568,15 @@ def write_experiment_artifacts(
                 "market_regime_attribution": (
                     case.regime_attribution.to_summary()
                 ),
+                "bootstrap_uncertainty": (
+                    case.bootstrap_uncertainty.to_summary()
+                ),
                 "experiment_result_sha256": result.result_sha256,
             },
+        )
+        _write_json(
+            case_directory / "bootstrap_uncertainty.json",
+            case.bootstrap_uncertainty.to_summary(),
         )
         _write_csv(
             case_directory / "regime_attribution.csv",
@@ -623,12 +630,15 @@ def write_experiment_artifacts(
         )
         _write_backtest_result_files(case_directory, case.result)
 
-    files = sorted(
+    artifact_files = sorted(
         str(path.relative_to(destination))
         for path in destination.rglob("*")
         if path.is_file()
     )
-    files.append("manifest.json")
+    file_sha256 = {
+        name: _file_sha256(destination / name) for name in artifact_files
+    }
+    files = sorted([*artifact_files, "manifest.json"])
     source_payload = dict(market_source)
     source_payload["sha256"] = source_hash
     if market_source_path is not None:
@@ -652,7 +662,8 @@ def write_experiment_artifacts(
             "python_version": platform.python_version(),
             "research_only": True,
             "investment_validity_established": False,
-            "files": sorted(files),
+            "files": files,
+            "file_sha256": file_sha256,
         },
     )
     return destination

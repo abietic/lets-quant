@@ -171,6 +171,29 @@ class ExperimentTest(unittest.TestCase):
                 for case in result.cases
             )
         )
+        uncertainty = result.summary["test_bootstrap_uncertainty"]
+        self.assertTrue(uncertainty["enabled"])
+        self.assertTrue(uncertainty["descriptive_only"])
+        self.assertFalse(uncertainty["p_value_reported"])
+        self.assertFalse(uncertainty["pooled_performance_estimate"])
+        self.assertFalse(uncertainty["test_windows_overlap"])
+        self.assertEqual(uncertainty["test_case_count"], 8)
+        self.assertEqual(uncertainty["enabled_case_count"], 8)
+        self.assertEqual(uncertainty["comparison_count"], 4)
+        self.assertTrue(
+            all(
+                comparison["strategy_total_return"]["available_case_count"]
+                == 2
+                for comparison in uncertainty["comparisons"]
+            )
+        )
+        self.assertTrue(
+            all(
+                case.bootstrap_uncertainty.enabled
+                == (case.window.role == "test")
+                for case in result.cases
+            )
+        )
 
     def test_walk_forward_test_windows_must_advance(self) -> None:
         raw = json.loads(
@@ -251,6 +274,19 @@ class ExperimentTest(unittest.TestCase):
         self.assertFalse(summary["enabled"])
         self.assertEqual(summary["test_case_count"], 3)
         self.assertEqual(summary["comparison_count"], 0)
+        uncertainty = result.summary["test_bootstrap_uncertainty"]
+        self.assertTrue(uncertainty["enabled"])
+        self.assertIsNone(uncertainty["benchmark"])
+        self.assertEqual(uncertainty["enabled_case_count"], 3)
+        self.assertEqual(uncertainty["comparison_count"], 3)
+        self.assertTrue(
+            all(
+                comparison["strategy_total_return"] is not None
+                and comparison["benchmark_total_return"] is None
+                and comparison["strategy_relative_to_benchmark"] is None
+                for comparison in uncertainty["comparisons"]
+            )
+        )
 
 
 if __name__ == "__main__":

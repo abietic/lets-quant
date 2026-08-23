@@ -319,12 +319,29 @@ class CliTest(unittest.TestCase):
                     for case in case_directories
                 )
             )
+            self.assertTrue(
+                all(
+                    (case / "bootstrap_uncertainty.json").exists()
+                    for case in case_directories
+                )
+            )
+            uncertainty_path = (
+                case_directories[0] / "bootstrap_uncertainty.json"
+            )
+            uncertainty_relative_path = str(
+                uncertainty_path.relative_to(experiment_directory)
+            )
+            self.assertEqual(
+                manifest["file_sha256"][uncertainty_relative_path],
+                hashlib.sha256(uncertainty_path.read_bytes()).hexdigest(),
+            )
             summary = json.loads(
                 (experiment_directory / "summary.json").read_text(
                     encoding="utf-8"
                 )
             )
             self.assertTrue(summary["test_market_regime_attribution"]["enabled"])
+            self.assertTrue(summary["test_bootstrap_uncertainty"]["enabled"])
 
     def test_paper_event_replay_is_restart_safe(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

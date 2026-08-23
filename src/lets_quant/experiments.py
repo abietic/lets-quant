@@ -19,6 +19,14 @@ from .regimes import (
     RegimeAttributionError,
     attribute_market_regimes,
 )
+from .uncertainty import (
+    DEFAULT_BOOTSTRAP_PROTOCOL,
+    BootstrapInterval,
+    BootstrapUncertainty,
+    BootstrapUncertaintyError,
+    bootstrap_return_uncertainty,
+    disabled_bootstrap_uncertainty,
+)
 
 
 class ExperimentError(ValueError):
@@ -106,6 +114,7 @@ class ExperimentCaseResult:
     parameter_variant: ParameterVariant
     result: BacktestResult
     regime_attribution: RegimeAttribution
+    bootstrap_uncertainty: BootstrapUncertainty
 
 
 @dataclass(frozen=True)
@@ -613,6 +622,7 @@ def _case_summary(case: ExperimentCaseResult) -> Dict[str, Any]:
         "decision_count": metrics["decision_count"],
         "filled_trade_count": metrics["filled_trade_count"],
         "market_regime_attribution": case.regime_attribution.to_summary(),
+        "bootstrap_uncertainty": case.bootstrap_uncertainty.to_summary(),
     }
 
 
@@ -679,6 +689,202 @@ def _parameter_stability_summary(
     }
 
 
+def _test_window_metadata(
+    cases: Sequence[ExperimentCaseResult],
+) -> Dict[str, Any]:
+    unique_windows = sorted(
+        {
+            (case.window.fold, case.window.start, case.window.end)
+            for case in cases
+            if case.window.role == "test"
+        },
+        key=lambda item: (item[1], item[2], item[0]),
+    )
+    overlapping_windows = any(
+        first_window[1] <= second_window[2]
+        and second_window[1] <= first_window[2]
+        for index, first_window in enumerate(unique_windows)
+        for second_window in unique_windows[index + 1 :]
+    )
+    return {
+        "test_window_count": len(unique_windows),
+        "test_windows_overlap": overlapping_windows,
+    }
+
+
+def _bootstrap_interval_aggregate(
+    intervals: Sequence[Optional[BootstrapInterval]],
+) -> Optional[Dict[str, Any]]:
+    available = [interval for interval in intervals if interval is not None]
+    if not available:
+        return None
+    return {
+        "available_case_count": len(available),
+        "minimum_point_estimate": min(
+            interval.point_estimate for interval in available
+        ),
+        "maximum_point_estimate": max(
+            interval.point_estimate for interval in available
+        ),
+        "minimum_lower_bound": min(interval.lower for interval in available),
+        "maximum_upper_bound": max(interval.upper for interval in available),
+        "minimum_positive_resample_fraction": min(
+            interval.positive_resample_fraction for interval in available
+        ),
+    }
+
+
+def _test_bootstrap_uncertainty_summary(
+    cases: Sequence[ExperimentCaseResult],
+) -> Dict[str, Any]:
+    if not cases:
+        raise ExperimentError("bootstrap summary requires experiment cases")
+    uncertainties = [case.bootstrap_uncertainty for case in cases]
+    first = uncertainties[0]
+    if any(
+        uncertainty.protocol != first.protocol
+        or uncertainty.benchmark != first.benchmark
+        for uncertainty in uncertainties
+    ):
+        raise ExperimentError(
+            "bootstrap protocol or benchmark changed within an experiment"
+        )
+    if any(
+        uncertainty.enabled
+        != (uncertainty.strategy_total_return is not None)
+        for uncertainty in uncertainties
+    ):
+        raise ExperimentError("bootstrap enabled state is internally inconsistent")
+    if any(
+        not uncertainty.enabled
+        and (
+            uncertainty.benchmark_total_return is not None
+            or uncertainty.strategy_relative_to_benchmark is not None
+            or uncertainty.resample_schedule_sha256 is not None
+            or uncertainty.replicates_sha256 is not None
+        )
+        for uncertainty in uncertainties
+    ):
+        raise ExperimentError("disabled bootstrap contains generated results")
+    if any(
+        case.window.role != "test" and case.bootstrap_uncertainty.enabled
+        for case in cases
+    ):
+        raise ExperimentError("bootstrap must not run outside test windows")
+    if first.benchmark is None and any(
+        uncertainty.benchmark_total_return is not None
+        or uncertainty.strategy_relative_to_benchmark is not None
+        for uncertainty in uncertainties
+    ):
+        raise ExperimentError(
+            "benchmark bootstrap intervals require a configured benchmark"
+        )
+    if first.benchmark is not None and any(
+        uncertainty.enabled
+        and (
+            uncertainty.benchmark_total_return is None
+            or uncertainty.strategy_relative_to_benchmark is None
+        )
+        for uncertainty in uncertainties
+    ):
+        raise ExperimentError(
+            "enabled benchmark bootstrap must include paired intervals"
+        )
+
+    test_cases = [case for case in cases if case.window.role == "test"]
+    grouped: Dict[tuple[str, str], List[ExperimentCaseResult]] = {}
+    for case in test_cases:
+        key = (
+            case.execution_scenario.name,
+            case.parameter_variant.name,
+        )
+        grouped.setdefault(key, []).append(case)
+
+    comparisons: List[Dict[str, Any]] = []
+    for (execution_scenario, parameter_variant), group in grouped.items():
+        group_uncertainties = [case.bootstrap_uncertainty for case in group]
+        comparisons.append(
+            {
+                "execution_scenario": execution_scenario,
+                "parameter_variant": parameter_variant,
+                "case_count": len(group),
+                "fold_count": len({case.window.fold for case in group}),
+                "enabled_case_count": sum(
+                    1 for uncertainty in group_uncertainties if uncertainty.enabled
+                ),
+                "disabled_case_count": sum(
+                    1
+                    for uncertainty in group_uncertainties
+                    if not uncertainty.enabled
+                ),
+                "disabled_reasons": sorted(
+                    {
+                        uncertainty.disabled_reason
+                        for uncertainty in group_uncertainties
+                        if uncertainty.disabled_reason is not None
+                    }
+                ),
+                "strategy_total_return": _bootstrap_interval_aggregate(
+                    [
+                        uncertainty.strategy_total_return
+                        for uncertainty in group_uncertainties
+                    ]
+                ),
+                "benchmark_total_return": _bootstrap_interval_aggregate(
+                    [
+                        uncertainty.benchmark_total_return
+                        for uncertainty in group_uncertainties
+                    ]
+                ),
+                "strategy_relative_to_benchmark": (
+                    _bootstrap_interval_aggregate(
+                        [
+                            uncertainty.strategy_relative_to_benchmark
+                            for uncertainty in group_uncertainties
+                        ]
+                    )
+                ),
+            }
+        )
+
+    enabled_test_count = sum(
+        1 for case in test_cases if case.bootstrap_uncertainty.enabled
+    )
+    return {
+        "enabled": enabled_test_count > 0,
+        "benchmark": first.benchmark,
+        "protocol": first.protocol.to_dict(),
+        "test_only": True,
+        "resampling_unit": "daily log-return blocks",
+        "benchmark_pairing": (
+            "shared source indices"
+            if first.benchmark is not None
+            else "not applicable"
+        ),
+        "confidence_interval_method": "percentile",
+        "descriptive_only": True,
+        "investment_validity_established": False,
+        "p_value_reported": False,
+        "used_for_strategy_decisions": False,
+        "used_for_parameter_selection": False,
+        "pooled_performance_estimate": False,
+        "aggregation_unit": "per-case interval bounds",
+        "test_case_count": len(test_cases),
+        "enabled_case_count": enabled_test_count,
+        "disabled_case_count": len(test_cases) - enabled_test_count,
+        "disabled_reasons": sorted(
+            {
+                case.bootstrap_uncertainty.disabled_reason
+                for case in test_cases
+                if case.bootstrap_uncertainty.disabled_reason is not None
+            }
+        ),
+        **_test_window_metadata(cases),
+        "comparison_count": len(comparisons),
+        "comparisons": comparisons,
+    }
+
+
 def _test_market_regime_summary(
     cases: Sequence[ExperimentCaseResult],
 ) -> Dict[str, Any]:
@@ -707,6 +913,7 @@ def _test_market_regime_summary(
             **base,
             "disabled_reason": first.disabled_reason,
             "test_case_count": len(test_cases),
+            **_test_window_metadata(cases),
             "comparison_count": 0,
             "comparisons": [],
         }
@@ -801,24 +1008,10 @@ def _test_market_regime_summary(
             }
         )
 
-    unique_windows = sorted(
-        {
-            (case.window.fold, case.window.start, case.window.end)
-            for case in test_cases
-        },
-        key=lambda item: (item[1], item[2], item[0]),
-    )
-    overlapping_windows = any(
-        first_window[1] <= second_window[2]
-        and second_window[1] <= first_window[2]
-        for index, first_window in enumerate(unique_windows)
-        for second_window in unique_windows[index + 1 :]
-    )
     return {
         **base,
         "test_case_count": len(test_cases),
-        "test_window_count": len(unique_windows),
-        "test_windows_overlap": overlapping_windows,
+        **_test_window_metadata(cases),
         "comparison_count": len(comparisons),
         "comparisons": comparisons,
     }
@@ -832,6 +1025,7 @@ def run_experiment(
         "policy": policy.to_dict(),
         "market_sha256": _sha256_json(market_identity(market)),
         "regime_protocol": DEFAULT_REGIME_PROTOCOL.to_dict(),
+        "bootstrap_protocol": DEFAULT_BOOTSTRAP_PROTOCOL.to_dict(),
     }
     experiment_input_id = _sha256_json(input_payload)
     cases: List[ExperimentCaseResult] = []
@@ -851,6 +1045,14 @@ def run_experiment(
                     start_date=window.start,
                     end_date=window.end,
                 )
+                case_id = _sha256_json(
+                    {
+                        "experiment_input_id": experiment_input_id,
+                        "window": window.to_dict(),
+                        "execution_scenario": execution_scenario.to_dict(),
+                        "parameter_variant": parameter_variant.to_dict(),
+                    }
+                )
                 try:
                     regime_attribution = attribute_market_regimes(
                         market,
@@ -862,14 +1064,35 @@ def run_experiment(
                     raise ExperimentError(
                         f"market-regime attribution failed: {exc}"
                     ) from exc
-                case_id = _sha256_json(
-                    {
-                        "experiment_input_id": experiment_input_id,
-                        "window": window.to_dict(),
-                        "execution_scenario": execution_scenario.to_dict(),
-                        "parameter_variant": parameter_variant.to_dict(),
-                    }
+                bootstrap_seed_material = _sha256_json(
+                    {"experiment_seed": spec.seed, "case_id": case_id}
                 )
+                try:
+                    if window.role == "test":
+                        bootstrap_uncertainty = bootstrap_return_uncertainty(
+                            market,
+                            case_policy.portfolio.benchmark,
+                            result.nav,
+                            seed_material=bootstrap_seed_material,
+                            protocol=DEFAULT_BOOTSTRAP_PROTOCOL,
+                        )
+                    else:
+                        bootstrap_uncertainty = (
+                            disabled_bootstrap_uncertainty(
+                                observation_count=max(0, len(result.nav) - 1),
+                                seed_material=bootstrap_seed_material,
+                                reason=(
+                                    "bootstrap uncertainty is limited to "
+                                    "test windows"
+                                ),
+                                benchmark=case_policy.portfolio.benchmark,
+                                protocol=DEFAULT_BOOTSTRAP_PROTOCOL,
+                            )
+                        )
+                except BootstrapUncertaintyError as exc:
+                    raise ExperimentError(
+                        f"bootstrap uncertainty failed: {exc}"
+                    ) from exc
                 cases.append(
                     ExperimentCaseResult(
                         case_id=case_id,
@@ -878,6 +1101,7 @@ def run_experiment(
                         parameter_variant=parameter_variant,
                         result=result,
                         regime_attribution=regime_attribution,
+                        bootstrap_uncertainty=bootstrap_uncertainty,
                     )
                 )
 
@@ -919,6 +1143,9 @@ def run_experiment(
             spec, cases
         ),
         "test_market_regime_attribution": _test_market_regime_summary(cases),
+        "test_bootstrap_uncertainty": (
+            _test_bootstrap_uncertainty_summary(cases)
+        ),
     }
     result_sha256 = _sha256_json(
         {
@@ -931,6 +1158,7 @@ def run_experiment(
                     "parameter_variant": case.parameter_variant.to_dict(),
                     "result": case.result,
                     "regime_attribution": case.regime_attribution,
+                    "bootstrap_uncertainty": case.bootstrap_uncertainty,
                 }
                 for case in cases
             ],
