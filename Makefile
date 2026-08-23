@@ -1,12 +1,15 @@
 PYTHON ?= python3
 PYTHONPATH := $(CURDIR)/src
 
-.PHONY: check compile test validate demo plan m1-validate m1-demo m15-demo m2-demo paper-demo
+.PHONY: check compile lint test validate demo plan m1-validate m1-demo m15-demo m2-demo paper-demo paper-audit-demo
 
 check: compile test
 
 compile:
 	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m compileall -q src tests
+
+lint:
+	$(PYTHON) -m ruff check --select E,F src tests
 
 test:
 	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m unittest discover -s tests -v
@@ -77,3 +80,15 @@ paper-demo:
 		--initial-cash 100000 \
 		--events examples/paper/events.jsonl \
 		--state-out artifacts/paper/demo-state.json
+
+paper-audit-demo:
+	@set -eu; \
+	state_path="artifacts/paper/audit-demo-state.json"; \
+	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant replay-paper-events \
+		--initial-cash 100000 \
+		--events examples/paper/audit_events.jsonl \
+		--state-out "$$state_path" >/dev/null; \
+	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant audit-paper-state \
+		--state "$$state_path" \
+		--audit-input examples/paper/audit_input.json \
+		--report-out artifacts/paper/audit-demo-report.json

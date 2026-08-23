@@ -275,6 +275,46 @@ class CliTest(unittest.TestCase):
             )
             self.assertFalse(second_payload["automatic_execution_allowed"])
 
+    def test_paper_audit_cli_writes_checksummed_review_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            state_path = temporary / "state.json"
+            report_path = temporary / "report.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                replay_exit = main(
+                    [
+                        "replay-paper-events",
+                        "--initial-cash",
+                        "100000",
+                        "--events",
+                        str(ROOT / "examples/paper/audit_events.jsonl"),
+                        "--state-out",
+                        str(state_path),
+                    ]
+                )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                audit_exit = main(
+                    [
+                        "audit-paper-state",
+                        "--state",
+                        str(state_path),
+                        "--audit-input",
+                        str(ROOT / "examples/paper/audit_input.json"),
+                        "--report-out",
+                        str(report_path),
+                    ]
+                )
+
+            output = json.loads(stdout.getvalue())
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(replay_exit, 0)
+            self.assertEqual(audit_exit, 0)
+            self.assertEqual(output["status"], "review_required")
+            self.assertEqual(output["report_sha256"], report["report_sha256"])
+            self.assertFalse(report["automatic_execution_allowed"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,7 +28,15 @@ from .experiments import (
     market_identity,
     run_experiment,
 )
-from .execution import PaperExchange, PaperExecutionError, replay_event_file
+from .execution import (
+    PaperAuditError,
+    PaperExchange,
+    PaperExecutionError,
+    audit_paper_exchange,
+    load_paper_audit_input,
+    replay_event_file,
+    save_paper_audit_report,
+)
 from .models import MarketData, Policy
 from .orders import build_manual_order_plan
 from .providers import DailyBarsRequest
@@ -190,6 +198,14 @@ def build_parser() -> argparse.ArgumentParser:
     paper.add_argument("--holdings", type=Path)
     paper.add_argument("--events", type=Path, required=True)
     paper.add_argument("--state-out", type=Path, required=True)
+
+    paper_audit = subcommands.add_parser(
+        "audit-paper-state",
+        help="audit offline paper health, fills, and imported account state",
+    )
+    paper_audit.add_argument("--state", type=Path, required=True)
+    paper_audit.add_argument("--audit-input", type=Path, required=True)
+    paper_audit.add_argument("--report-out", type=Path, required=True)
     return parser
 
 
@@ -567,6 +583,30 @@ def _replay_paper_events(args: argparse.Namespace) -> int:
     return 0
 
 
+def _audit_paper_state(args: argparse.Namespace) -> int:
+    exchange = PaperExchange.load(args.state)
+    audit_input = load_paper_audit_input(args.audit_input)
+    report = audit_paper_exchange(exchange, audit_input)
+    save_paper_audit_report(report, args.report_out)
+    print(
+        json.dumps(
+            {
+                "status": report["status"],
+                "execution_mode": "offline_paper",
+                "automatic_execution_allowed": False,
+                "report_path": str(args.report_out.resolve()),
+                "report_sha256": report["report_sha256"],
+                "paper_state_sha256": report["paper_state_sha256"],
+                "audit_input_sha256": report["audit_input_sha256"],
+                "summary": report["summary"],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 3 if report["status"] == "blocked" else 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -591,9 +631,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _plan_orders(args)
         if args.command == "replay-paper-events":
             return _replay_paper_events(args)
+        if args.command == "audit-paper-state":
+            return _audit_paper_state(args)
     except (
         DataError,
         ExperimentError,
+        PaperAuditError,
         PaperExecutionError,
         PolicyError,
         ResearchPolicyError,

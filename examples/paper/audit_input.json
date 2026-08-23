@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "as_of": "2025-01-03T09:35:00+08:00",
+  "thresholds": {
+    "max_quote_age_seconds": 300,
+    "max_task_age_seconds": 600,
+    "max_account_age_seconds": 600,
+    "max_open_order_age_seconds": 900,
+    "max_fill_latency_seconds": 600,
+    "max_abs_slippage_bps": 20,
+    "max_fee_deviation": 0.01,
+    "cash_tolerance": 0.01
+  },
+  "required_tasks": [
+    "paper-event-replay"
+  ],
+  "quotes": [],
+  "order_expectations": [
+    {
+      "client_order_id": "paper-buy-001",
+      "decision_id": "demo-decision-001",
+      "symbol": "ASSET_A",
+      "side": "BUY",
+      "expected_order_quantity": 100,
+      "expected_fill_quantity": 100,
+      "expected_average_fill_price": 10.6,
+      "expected_fees": 2,
+      "expected_terminal_status": "FILLED",
+      "expected_fill_by": "2025-01-02T09:35:00+08:00"
+    },
+    {
+      "client_order_id": "paper-sell-001",
+      "decision_id": "demo-decision-002",
+      "symbol": "ASSET_A",
+      "side": "SELL",
+      "expected_order_quantity": 20,
+      "expected_fill_quantity": 20,
+      "expected_average_fill_price": 12,
+      "expected_fees": 1.12,
+      "expected_terminal_status": "FILLED",
+      "expected_fill_by": "2025-01-03T09:35:00+08:00"
+    }
+  ],
+  "task_checks": [
+    {
+      "task_id": "paper-event-replay",
+      "status": "ok",
+      "observed_at": "2025-01-03T09:34:00+08:00",
+      "details": "offline fixture replay completed"
+    }
+  ],
+  "risk_state": {
+    "frozen": false,
+    "reasons": []
+  },
+  "external_account": {
+    "source": "offline-audit-fixture",
+    "source_kind": "fixture",
+    "observed_at": "2025-01-03T09:34:00+08:00",
+    "cash": 99176.88,
+    "positions": {
+      "ASSET_A": 80
+    },
+    "orders": [
+      {
+        "client_order_id": "paper-buy-001",
+        "status": "FILLED",
+        "filled_quantity": 100,
+        "venue_order_id": "venue-001"
+      },
+      {
+        "client_order_id": "paper-sell-001",
+        "status": "FILLED",
+        "filled_quantity": 20,
+        "venue_order_id": "venue-002"
+      }
+    ]
+  }
+}

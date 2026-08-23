@@ -20,6 +20,7 @@
 - 六类确定性合成市场，用于验证软件语义和失败边界。
 - 显式现金/持仓账本、公司行动入账和每日资产恒等式校验。
 - 可持久化的离线 paper 订单状态机、事件幂等和重启恢复。
+- 离线 Paper 运营审计：行情/任务新鲜度、风险冻结、成交偏差和导入账户对账。
 - 只供人工审批的订单建议，不连接券商、不自动下单。
 
 示例中的 `ASSET_A`、`ASSET_B`、`ASSET_C` 和价格都是合成数据，不代表
@@ -40,6 +41,7 @@ make m1-demo
 make m15-demo
 make m2-demo
 make paper-demo
+make paper-audit-demo
 ```
 
 `make m1-demo` 使用短小的合成行情跑通“原始快照 -> point-in-time
@@ -180,6 +182,27 @@ PYTHONPATH=src python3 -m lets_quant replay-paper-events \
 这是本地状态机测试工具，不是券商 paper adapter，不会联网，也不会自动读取
 回测成交或发送订单。`automatic_execution_allowed` 始终为 `false`。
 
+## M3 离线运营审计
+
+`audit-paper-state` 将带校验和的 Paper 状态与严格的运营审计输入进行比较：
+
+```bash
+PYTHONPATH=src python3 -m lets_quant audit-paper-state \
+  --state artifacts/paper/audit-demo-state.json \
+  --audit-input examples/paper/audit_input.json \
+  --report-out artifacts/paper/audit-demo-report.json
+```
+
+它会检查活动订单行情是否过期、任务是否失败、风险是否冻结、订单是否超时，
+并按 `decision_id` 比较预期与实际成交数量、均价、费用和延迟。可选的外部账户
+快照用于核对现金、持仓、订单状态、成交数量和柜台订单号。
+
+报告状态为 `pass`、`review_required` 或 `blocked`。存在 critical 告警时命令
+返回退出码 `3`，但仍保存带 `report_sha256` 的报告。fixture 对账即使完全一致
+也只能得到 `review_required`；当前实现不验证文件来源，不连接券商，也不允许
+自动执行。输入格式、告警和适配器边界见
+[离线 Paper 运营审计](docs/PAPER_OPERATIONS.md)。
+
 ## 输入格式
 
 价格数据必须提供每个交易日的完整价格，不会自动向前填充：
@@ -281,6 +304,7 @@ AKShare 的 MIT 许可是代码许可，不等于其上游行情的再分发或�
 - [架构和安全不变量](docs/ARCHITECTURE.md)
 - [分阶段路线图](docs/ROADMAP.md)
 - [M1 数据管道](docs/DATA_PIPELINE.md)
+- [离线 Paper 运营审计](docs/PAPER_OPERATIONS.md)
 
 本项目不提供投资建议。接入中国证券市场自动交易前，需要向开户券商确认
 程序化交易权限、报告义务、接口限制和当前监管要求。

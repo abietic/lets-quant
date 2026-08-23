@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lets-quant"
-version = "0.5.0"
+version = "0.6.0"
 description = "A local-first, research-only personal quantitative investing toolkit"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -16,6 +16,7 @@ dependencies = []
 
 [project.optional-dependencies]
 akshare = ["akshare==1.18.79"]
+dev = ["ruff==0.16.4"]
 
 [project.scripts]
 lets-quant = "lets_quant.cli:main"
