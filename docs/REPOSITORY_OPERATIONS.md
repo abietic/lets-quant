@@ -19,6 +19,17 @@ make vectorbt-test PYTHON=.venv-vectorbt/bin/python
 make rqalpha-test PYTHON=.venv-rqalpha/bin/python
 ```
 
+为当前 clone 启用仓库内的推送门禁：
+
+```bash
+make install-git-hooks
+git config --local --get core.hooksPath
+```
+
+`.githooks/pre-push` 只验证本次新增的 commit 和 tag：commit 必须通过
+`git verify-commit`，tag 必须是可验证的 annotated tag 且指向已签名 commit；随后
+执行 `make ci`。该设置只写入当前仓库的 `.git/config`，不会修改全局 Git 配置。
+
 ## 持续集成
 
 [`ci.yml`](../.github/workflows/ci.yml) 在 `main` push、pull request 和人工触发时运行：
