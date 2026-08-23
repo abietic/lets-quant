@@ -19,12 +19,15 @@ VECTORBT_AVAILABLE = importlib.util.find_spec("vectorbt") is not None
 @unittest.skipUnless(VECTORBT_AVAILABLE, "vectorbt optional dependency missing")
 class VectorbtAdapterTest(unittest.TestCase):
     def _run_validation(
-        self, temporary: Path, policy_path: Path, prices_path: Path
+        self,
+        temporary: Path,
+        policy_path: Path,
+        prices_path: Path,
+        initial_holdings_path: Path = None,
     ) -> dict:
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
-            backtest_exit = main(
-                [
+            args = [
                     "backtest",
                     "--policy",
                     str(policy_path),
@@ -33,7 +36,11 @@ class VectorbtAdapterTest(unittest.TestCase):
                     "--output-root",
                     str(temporary / "reference"),
                 ]
-            )
+            if initial_holdings_path is not None:
+                args.extend(
+                    ["--initial-holdings", str(initial_holdings_path)]
+                )
+            backtest_exit = main(args)
         reference = json.loads(stdout.getvalue())["artifact_directory"]
         self.assertEqual(backtest_exit, 0)
 
@@ -111,6 +118,81 @@ class VectorbtAdapterTest(unittest.TestCase):
 
             self.assertEqual(payload["status"], "pass")
             self.assertEqual(payload["summary"]["candidate_nav_rows"], 4)
+
+    def test_nonzero_initial_holdings_reconcile_from_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            payload = self._run_validation(
+                temporary,
+                ROOT / "config/policy.example.json",
+                ROOT / "examples/prices.csv",
+                ROOT / "examples/holdings.csv",
+            )
+
+            self.assertEqual(payload["status"], "pass")
+            self.assertEqual(payload["summary"]["max_abs_nav_difference"], 0)
+            candidate = Path(payload["candidate_directory"])
+            manifest = json.loads(
+                (candidate / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["validation_scope"]["initial_position_count"], 3
+            )
+
+    def test_first_day_split_applies_after_opening_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            holdings_path = temporary / "holdings.csv"
+            holdings_path.write_text(
+                "symbol,quantity\n510300.XSHG,100\n",
+                encoding="utf-8",
+            )
+            fixture = build_curated_reference(
+                temporary / "fixture",
+                adjustment="none",
+                corporate_action_rows=[
+                    {
+                        "symbol": "510300.XSHG",
+                        "event_type": "split",
+                        "ex_date": "2025-01-02",
+                        "announced_at": "2025-01-01T09:00:00+08:00",
+                        "cash_amount": "",
+                        "ratio": "2",
+                        "available_at": "2025-01-01T09:00:00+08:00",
+                    }
+                ],
+                initial_holdings_path=holdings_path,
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "validate-vectorbt",
+                        "--reference-run",
+                        str(fixture["reference"]),
+                        "--dataset",
+                        str(fixture["dataset"]),
+                        "--output-root",
+                        str(temporary / "candidate"),
+                    ]
+                )
+            payload = json.loads(stdout.getvalue())
+
+            self.assertEqual(exit_code, 0, payload)
+            self.assertEqual(payload["status"], "pass")
+            candidate = Path(payload["candidate_directory"])
+            with (candidate / "nav.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                first_nav = next(csv.DictReader(handle))
+            self.assertEqual(
+                json.loads(first_nav["positions"])["510300.XSHG"], 200
+            )
+            with (candidate / "corporate_actions.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                action = next(csv.DictReader(handle))
+            self.assertEqual(action["quantity_delta"], "100")
 
     def test_curated_suspension_is_rejected_without_losing_lineage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

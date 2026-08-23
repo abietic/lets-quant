@@ -18,6 +18,7 @@ from .accounting import AccountingError, AccountingLedger
 from .data import validate_market_coverage
 from .models import (
     BacktestResult,
+    Holding,
     MarketData,
     NavRecord,
     OrderIntent,
@@ -61,12 +62,23 @@ BASE_ASSUMPTIONS = [
 
 
 def _assumptions(
-    execution_delay_trading_days: int, market: MarketData
+    execution_delay_trading_days: int,
+    market: MarketData,
+    initial_positions: Mapping[str, int],
 ) -> List[str]:
+    opening_assumptions = (
+        [
+            "Configured initial cash remains cash in addition to imported "
+            "opening positions; returns and baselines start from first-day NAV."
+        ]
+        if any(initial_positions.values())
+        else []
+    )
     return [
         "Signals are generated after a daily close and execute "
         f"{execution_delay_trading_days} trading day(s) later at the close.",
         f"Market price adjustment convention is {market.price_adjustment}.",
+        *opening_assumptions,
         *BASE_ASSUMPTIONS,
     ]
 
@@ -441,13 +453,46 @@ def _buy_and_hold_values(
 
 
 def _static_target_values(
-    policy: Policy, market: MarketData
+    policy: Policy, market: MarketData, initial_capital: float
 ) -> List[float]:
     return _buy_and_hold_values(
-        policy.portfolio.initial_cash,
+        initial_capital,
         policy.strategy.target_weights,
         market,
     )
+
+
+def _opening_positions(
+    policy: Policy, initial_holdings: Iterable[Holding]
+) -> Dict[str, int]:
+    positions = {symbol: 0 for symbol in policy.strategy.target_weights}
+    seen = set()
+    for holding in initial_holdings:
+        symbol = str(holding.symbol).strip().upper()
+        quantity = holding.quantity
+        if not symbol:
+            raise StrategyError("initial holding symbol must not be empty")
+        if symbol in seen:
+            raise StrategyError(f"duplicate initial holding for {symbol}")
+        seen.add(symbol)
+        if symbol not in positions:
+            raise StrategyError(
+                f"initial holding is outside the strategy scope: {symbol}"
+            )
+        if (
+            isinstance(quantity, bool)
+            or not isinstance(quantity, int)
+            or quantity < 0
+        ):
+            raise StrategyError(
+                f"initial holding for {symbol} must be an integer >= 0"
+            )
+        if quantity % policy.execution.lot_size != 0:
+            raise StrategyError(
+                f"initial holding for {symbol} must be a multiple of lot_size"
+            )
+        positions[symbol] = quantity
+    return positions
 
 
 def _evaluation_market(
@@ -497,6 +542,7 @@ def run_backtest(
     execution_delay_trading_days: int = 1,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    initial_holdings: Iterable[Holding] = (),
 ) -> BacktestResult:
     if (
         isinstance(execution_delay_trading_days, bool)
@@ -518,7 +564,8 @@ def run_backtest(
     }
     last_evaluation_index = global_indices[evaluation_dates[-1]]
     strategy_instance = strategy or build_strategy(policy)
-    positions = {symbol: 0 for symbol in policy.strategy.target_weights}
+    positions = _opening_positions(policy, initial_holdings)
+    opening_positions = dict(positions)
     cash = policy.portfolio.initial_cash
     pending_orders: List[OrderIntent] = []
     nav_records: List[NavRecord] = []
@@ -527,7 +574,8 @@ def run_backtest(
     accounting_records = []
     ledger = AccountingLedger()
     ledger.record_initial_cash(evaluation_dates[0], cash)
-    peak_nav = policy.portfolio.initial_cash
+    ledger.record_initial_positions(evaluation_dates[0], opening_positions)
+    peak_nav = 0.0
     risk_frozen = False
 
     for evaluation_index, trading_date in enumerate(evaluation_dates):
@@ -810,11 +858,14 @@ def run_backtest(
         raise AccountingError("ledger execution cost attribution failed")
     metrics["cost_attribution_error"] = cost_attribution_error
 
-    cash_values = [policy.portfolio.initial_cash for _ in evaluation_dates]
-    static_target_values = _static_target_values(policy, evaluation_market)
+    initial_capital = nav_values[0]
+    cash_values = [initial_capital for _ in evaluation_dates]
+    static_target_values = _static_target_values(
+        policy, evaluation_market, initial_capital
+    )
     metrics["baselines"] = {
         "cash": {
-            "description": "hold initial cash; no market exposure",
+            "description": "hold first recorded NAV in cash; no market exposure",
             **_performance_metrics(cash_values, evaluation_dates),
         },
         "static_target_weights": {
@@ -829,7 +880,7 @@ def run_backtest(
     benchmark = policy.portfolio.benchmark
     if benchmark:
         benchmark_values = _buy_and_hold_values(
-            policy.portfolio.initial_cash,
+            initial_capital,
             {benchmark: 1.0},
             evaluation_market,
         )
@@ -863,7 +914,9 @@ def run_backtest(
         nav=nav_records,
         signals=signals,
         trades=trades,
-        assumptions=_assumptions(execution_delay_trading_days, market),
+        assumptions=_assumptions(
+            execution_delay_trading_days, market, opening_positions
+        ),
         ledger=ledger.entries,
         accounting=accounting_records,
     )

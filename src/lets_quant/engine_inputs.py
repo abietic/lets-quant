@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .cross_engine import EngineValidationError, file_sha256
-from .data import DataError, load_prices
+from .data import DataError, load_holdings, load_prices
 from .datasets import load_curated_dataset
 from .models import MarketData
 
@@ -50,6 +50,65 @@ class EngineMarketInput:
     dataset_directory: Optional[Path] = None
     dataset_manifest: Optional[Dict[str, Any]] = None
     dataset_snapshot_sha256: Optional[str] = None
+
+
+def load_reference_initial_positions(
+    reference_directory: Path,
+    *,
+    symbols: Sequence[str],
+    lot_size: int,
+    adapter_name: str,
+) -> Tuple[Dict[str, int], Optional[str]]:
+    manifest_path = reference_directory / "manifest.json"
+    manifest = load_json_object(manifest_path)
+    normalized_symbols = sorted(set(symbols))
+    positions = {symbol: 0 for symbol in normalized_symbols}
+    declared_files = manifest.get("files")
+    if not isinstance(declared_files, list):
+        raise EngineValidationError(
+            f"{manifest_path} files must be an array"
+        )
+    filename = "initial_holdings.csv"
+    if filename not in declared_files:
+        return positions, None
+    declared_hashes = manifest.get("file_sha256")
+    expected_hash = (
+        declared_hashes.get(filename)
+        if isinstance(declared_hashes, dict)
+        else None
+    )
+    if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+        raise EngineValidationError(
+            f"{manifest_path} has an invalid hash for {filename}"
+        )
+    if manifest.get("initial_holdings_snapshot_sha256") != expected_hash:
+        raise EngineValidationError(
+            f"{manifest_path} initial holdings snapshot hash is inconsistent"
+        )
+    holdings_path = reference_directory / filename
+    actual_hash = file_sha256(holdings_path)
+    if actual_hash != expected_hash:
+        raise EngineValidationError(
+            f"reference artifact integrity failed for {filename}: expected "
+            f"{expected_hash}, got {actual_hash}"
+        )
+    try:
+        holdings = load_holdings(holdings_path)
+    except DataError as exc:
+        raise EngineValidationError(str(exc)) from exc
+    for holding in holdings:
+        if holding.symbol not in positions:
+            raise EngineValidationError(
+                f"{adapter_name} initial holding is outside the strategy "
+                f"scope: {holding.symbol}"
+            )
+        if holding.quantity % lot_size != 0:
+            raise EngineValidationError(
+                f"{adapter_name} initial holding for {holding.symbol} must be "
+                "a multiple of lot_size"
+            )
+        positions[holding.symbol] = holding.quantity
+    return positions, actual_hash
 
 
 def load_json_object(path: Path) -> Dict[str, Any]:

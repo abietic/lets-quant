@@ -27,13 +27,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class CrossEngineTest(unittest.TestCase):
     def _reference_run(
-        self, temporary: Path, policy_path: Path = None
+        self,
+        temporary: Path,
+        policy_path: Path = None,
+        initial_holdings_path: Path = None,
     ) -> Path:
         policy_path = policy_path or ROOT / "config/policy.example.json"
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
-            exit_code = main(
-                [
+            args = [
                     "backtest",
                     "--policy",
                     str(policy_path),
@@ -42,7 +44,11 @@ class CrossEngineTest(unittest.TestCase):
                     "--output-root",
                     str(temporary / "reference"),
                 ]
-            )
+            if initial_holdings_path is not None:
+                args.extend(
+                    ["--initial-holdings", str(initial_holdings_path)]
+                )
+            exit_code = main(args)
         self.assertEqual(exit_code, 0, stdout.getvalue())
         return Path(json.loads(stdout.getvalue())["artifact_directory"])
 
@@ -583,6 +589,28 @@ class CrossEngineTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 EngineValidationError,
                 "reference artifact integrity failed for signals.csv",
+            ):
+                reconcile_engine_candidate(reference, candidate)
+
+    def test_initial_holdings_drift_fails_reference_integrity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            reference = self._reference_run(
+                temporary,
+                initial_holdings_path=ROOT / "examples/holdings.csv",
+            )
+            candidate = self._candidate_run(temporary, reference)
+            holdings_path = reference / "initial_holdings.csv"
+            holdings_path.write_text(
+                holdings_path.read_text(encoding="utf-8").replace(
+                    "ASSET_A,2000", "ASSET_A,2100"
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                EngineValidationError,
+                "reference artifact integrity failed for initial_holdings.csv",
             ):
                 reconcile_engine_candidate(reference, candidate)
 

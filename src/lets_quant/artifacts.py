@@ -8,10 +8,10 @@ import subprocess
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 from .experiments import ExperimentResult
-from .models import BacktestResult, ManualOrderPlan, Policy
+from .models import BacktestResult, Holding, ManualOrderPlan, Policy
 
 
 def _file_sha256(path: Path) -> str:
@@ -300,17 +300,50 @@ def write_backtest_artifacts(
     policy_path: Path,
     prices_path: Path,
     output_root: Path,
+    initial_holdings: Sequence[Holding] = (),
+    initial_holdings_path: Optional[Path] = None,
     dataset_manifest: Optional[Mapping[str, Any]] = None,
 ) -> Path:
     policy_hash = _file_sha256(policy_path)
     prices_hash = _file_sha256(prices_path)
+    normalized_holdings = [
+        {
+            "symbol": holding.symbol.strip().upper(),
+            "quantity": holding.quantity,
+        }
+        for holding in sorted(
+            (holding for holding in initial_holdings if holding.quantity > 0),
+            key=lambda item: item.symbol.strip().upper(),
+        )
+    ]
+    holdings_identity = hashlib.sha256(
+        json.dumps(
+            normalized_holdings,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    holdings_input_hash = (
+        _file_sha256(initial_holdings_path)
+        if initial_holdings_path is not None
+        else None
+    )
+    holdings_fingerprint = holdings_input_hash or holdings_identity
     project_root = _find_project_root(policy_path)
     destination = _run_directory(
-        output_root, hashlib.sha256((policy_hash + prices_hash).encode()).hexdigest()
+        output_root,
+        hashlib.sha256(
+            (policy_hash + prices_hash + holdings_fingerprint).encode()
+        ).hexdigest(),
     )
 
     _write_backtest_result_files(destination, result)
     _write_json(destination / "policy.snapshot.json", policy.to_dict())
+    _write_csv(
+        destination / "initial_holdings.csv",
+        normalized_holdings,
+        ["symbol", "quantity"],
+    )
     if dataset_manifest is not None:
         _write_json(
             destination / "dataset.snapshot.json", dict(dataset_manifest)
@@ -319,6 +352,7 @@ def write_backtest_artifacts(
     files = [
         "manifest.json",
         "accounting.csv",
+        "initial_holdings.csv",
         "ledger.csv",
         "metrics.json",
         "nav.csv",
@@ -342,6 +376,15 @@ def write_backtest_artifacts(
         "policy_sha256": policy_hash,
         "prices_path": str(prices_path.resolve()),
         "prices_sha256": prices_hash,
+        "initial_holdings_path": (
+            str(initial_holdings_path.resolve())
+            if initial_holdings_path is not None
+            else None
+        ),
+        "initial_holdings_input_sha256": holdings_input_hash,
+        "initial_holdings_snapshot_sha256": file_sha256[
+            "initial_holdings.csv"
+        ],
         "project_root": str(project_root),
         "source_revision": _git_revision(project_root),
         "source_tree_sha256": _source_tree_sha256(project_root),

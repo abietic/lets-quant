@@ -92,6 +92,36 @@ class AccountingLedger:
             description="opening research portfolio cash",
         )
 
+    def record_initial_positions(
+        self, trading_date: date, positions: Mapping[str, int]
+    ) -> None:
+        for symbol, quantity in sorted(positions.items()):
+            if not isinstance(symbol, str) or not symbol.strip():
+                raise AccountingError(
+                    "initial ledger position symbol must not be empty"
+                )
+            if (
+                isinstance(quantity, bool)
+                or not isinstance(quantity, int)
+                or quantity < 0
+            ):
+                raise AccountingError(
+                    f"initial ledger position for {symbol} must be an integer >= 0"
+                )
+            if quantity == 0:
+                continue
+            normalized_symbol = symbol.strip().upper()
+            self._record(
+                trading_date=trading_date,
+                event_type="initial_position",
+                symbol=normalized_symbol,
+                quantity_delta=quantity,
+                cash_delta=0.0,
+                expense=0.0,
+                reference_id=f"portfolio_initial_position:{normalized_symbol}",
+                description="opening research portfolio position",
+            )
+
     def record_trade(self, trade: TradeRecord, trade_index: int) -> None:
         if trade.filled_quantity <= 0:
             return

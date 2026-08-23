@@ -38,6 +38,7 @@ class CliTest(unittest.TestCase):
                 files,
                 {
                     "accounting.csv",
+                    "initial_holdings.csv",
                     "ledger.csv",
                     "manifest.json",
                     "metrics.json",
@@ -63,6 +64,45 @@ class CliTest(unittest.TestCase):
                     ).hexdigest(),
                     expected_hash,
                 )
+
+    def test_backtest_snapshots_nonzero_initial_holdings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "backtest",
+                        "--policy",
+                        str(ROOT / "config/policy.example.json"),
+                        "--prices",
+                        str(ROOT / "examples/prices.csv"),
+                        "--initial-holdings",
+                        str(ROOT / "examples/holdings.csv"),
+                        "--output-root",
+                        str(temporary / "runs"),
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 0, payload)
+            run_directory = Path(payload["artifact_directory"])
+            holdings = (run_directory / "initial_holdings.csv").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("ASSET_A,2000", holdings)
+            manifest = json.loads(
+                (run_directory / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["initial_holdings_path"],
+                str((ROOT / "examples/holdings.csv").resolve()),
+            )
+            self.assertEqual(
+                manifest["initial_holdings_snapshot_sha256"],
+                manifest["file_sha256"]["initial_holdings.csv"],
+            )
+            self.assertEqual(payload["metrics"]["starting_nav"], 145000.0)
 
     def test_example_order_plan_is_reviewable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

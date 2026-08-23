@@ -26,13 +26,13 @@ class RqalphaAdapterTest(unittest.TestCase):
         *,
         policy_path: Path = None,
         prices_path: Path = None,
+        initial_holdings_path: Path = None,
     ) -> Path:
         policy_path = policy_path or ROOT / "config/policy.example.json"
         prices_path = prices_path or ROOT / "examples/prices.csv"
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
-            exit_code = main(
-                [
+            args = [
                     "backtest",
                     "--policy",
                     str(policy_path),
@@ -41,7 +41,11 @@ class RqalphaAdapterTest(unittest.TestCase):
                     "--output-root",
                     str(temporary / "reference"),
                 ]
-            )
+            if initial_holdings_path is not None:
+                args.extend(
+                    ["--initial-holdings", str(initial_holdings_path)]
+                )
+            exit_code = main(args)
         self.assertEqual(exit_code, 0, stdout.getvalue())
         return Path(json.loads(stdout.getvalue())["artifact_directory"])
 
@@ -101,6 +105,85 @@ class RqalphaAdapterTest(unittest.TestCase):
             events = (candidate / "events.csv").read_text(encoding="utf-8")
             self.assertIn("order_unsolicited_update", events)
             self.assertIn("fill 3800 actually", events)
+
+    def test_nonzero_initial_holdings_use_native_account_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            reference = self._reference_run(
+                temporary,
+                initial_holdings_path=ROOT / "examples/holdings.csv",
+            )
+
+            exit_code, payload = self._validate(temporary, reference)
+
+            self.assertEqual(exit_code, 0, payload)
+            self.assertEqual(payload["status"], "pass")
+            self.assertEqual(payload["summary"]["max_abs_nav_difference"], 0)
+            self.assertEqual(
+                payload["summary"]["policy_decisions"]["mismatches"], []
+            )
+            candidate = Path(payload["candidate_directory"])
+            manifest = json.loads(
+                (candidate / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["validation_scope"]["initial_position_count"], 3
+            )
+
+    def test_first_day_split_applies_to_native_opening_position(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            holdings_path = temporary / "holdings.csv"
+            holdings_path.write_text(
+                "symbol,quantity\n510300.XSHG,100\n",
+                encoding="utf-8",
+            )
+            fixture = build_curated_reference(
+                temporary / "fixture",
+                adjustment="none",
+                corporate_action_rows=[
+                    {
+                        "symbol": "510300.XSHG",
+                        "event_type": "split",
+                        "ex_date": "2025-01-02",
+                        "announced_at": "2025-01-01T09:00:00+08:00",
+                        "cash_amount": "",
+                        "ratio": "2",
+                        "available_at": "2025-01-01T09:00:00+08:00",
+                    }
+                ],
+                initial_holdings_path=holdings_path,
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "validate-rqalpha",
+                        "--reference-run",
+                        str(fixture["reference"]),
+                        "--dataset",
+                        str(fixture["dataset"]),
+                        "--output-root",
+                        str(temporary / "candidate"),
+                    ]
+                )
+            payload = json.loads(stdout.getvalue())
+
+            self.assertEqual(exit_code, 0, payload)
+            self.assertEqual(payload["status"], "pass")
+            candidate = Path(payload["candidate_directory"])
+            with (candidate / "nav.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                first_nav = next(csv.DictReader(handle))
+            self.assertEqual(
+                json.loads(first_nav["positions"])["510300.XSHG"], 200
+            )
+            with (candidate / "corporate_actions.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                action = next(csv.DictReader(handle))
+            self.assertEqual(action["quantity_delta"], "100")
 
     def test_liquidity_partial_fill_stays_internally_reconciled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

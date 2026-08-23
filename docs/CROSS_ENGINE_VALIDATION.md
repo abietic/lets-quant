@@ -9,8 +9,8 @@
 
 | 引擎 | 主要独立证据 | 仍由适配层映射 |
 |---|---|---|
-| VectorBT 1.1.0 | 订单记录、共享现金、持仓和组合价值 | 停牌拒绝、企业行动回调、卖出顺序、现金缓冲、整手数量和费用拆分 |
-| RQAlpha 6.3.0 | 独立固定权重/动量 PIT 决策，清洗 OHLCV、原生停牌/分红/拆并股、撮合、费用、账户和 NAV | 目标整手与换手率规则、合成证券代码、动态现金缓冲、跨行动订单拒绝 |
+| VectorBT 1.1.0 | 订单记录、共享现金、持仓和组合价值 | 初始持仓、停牌拒绝、企业行动回调、卖出顺序、现金缓冲、整手数量和费用拆分 |
+| RQAlpha 6.3.0 | 独立固定权重/动量 PIT 决策，原生初始持仓、停牌/分红/拆并股、撮合、费用、账户和 NAV | 首日前哨日、目标整手与换手率规则、合成证券代码、动态现金缓冲、跨行动订单拒绝 |
 
 两条链路都只验证 manifest 明确声明的范围。RQAlpha 的独立实现可以发现固定
 权重和动量策略的 PIT 决策、目标整手及风险门禁漂移，但不能证明市场数据正确、
@@ -100,8 +100,28 @@ make rqalpha-test rqalpha-demo
 ```
 
 价格或数据集 SHA-256 必须与参考 manifest 一致。参考 manifest 还必须包含
-v0.7.0 引入的 `file_sha256` 映射。v0.11.0 的候选和报告 schema 已升级为 v5，
-并把参考 `ledger.csv` 哈希纳入绑定；旧候选必须重新生成，不能降级绕过。
+v0.7.0 引入的 `file_sha256` 映射。v0.12.0 的候选和报告 schema 已升级为 v6，
+并把参考 `ledger.csv` 与可选初始持仓快照哈希纳入绑定；旧候选必须重新生成，
+不能降级绕过。
+
+## 初始状态契约
+
+参考回测可传入 `--initial-holdings symbol,quantity CSV`。产物总会写规范化
+`initial_holdings.csv`；未传入时它是空表。原始输入 SHA-256 只记录来源，候选
+消费并绑定规范化快照；快照文件或 manifest 中的快照哈希发生漂移时，会在候选
+运行前或对账时失败。
+
+- `portfolio.initial_cash` 始终是现金余额，不会减去导入持仓市值。
+- 初始持仓只能包含策略标的、非负整数、整手多头；不支持策略外资产、碎股或
+  空头。
+- 快照数量表示第一个回测日企业行动前状态；参考账本先写 `initial_position`，
+  再处理同日分红/拆并股，第一行 NAV 记录处理后的状态。
+- 收益、现金、静态目标和基准比较均以第一行 NAV 为共同起点。
+
+VectorBT 在首个 pre-segment 回调中先注入初始持仓，再处理企业行动和订单。
+RQAlpha 使用原生 `init_positions`；由于其首日事件筛选需要“上一交易日”，数据源
+提供一个只供账户初始化的前哨日，并复用首日收盘估值。前哨日不进入运行日期轴、
+PIT 历史、NAV 或信号，但这一估值近似仍明确属于 adapter mapping。
 
 ## RQAlpha 流动性压力
 
@@ -124,7 +144,7 @@ PYTHONPATH=src python -m lets_quant validate-rqalpha \
 
 ## 候选契约
 
-候选 schema v5 的基础产物为：
+候选 schema v6 的基础产物为：
 
 - `manifest.json`：引擎版本、参考指纹、候选哈希、验证范围和限制。
 - `nav.csv`：逐日 NAV、现金和持仓。
@@ -199,9 +219,10 @@ PYTHONPATH=src python -m lets_quant reconcile-engine \
 
 ## 当前限制
 
-VectorBT adapter v3 与 RQAlpha adapter v4 接受 `standalone_prices_csv` 或质量
-通过且身份与参考快照一致的 `curated_dataset`，仍限日线、只做多、零初始持仓，
-且同标的同执行日最多一笔订单。VectorBT 的停牌拒绝属于显式 adapter lowering；
+VectorBT adapter v4 与 RQAlpha adapter v5 接受 `standalone_prices_csv` 或质量
+通过且身份与参考快照一致的 `curated_dataset`，仍限日线、只做多、策略范围内
+整手初始持仓，且同标的同执行日最多一笔订单。VectorBT 的初始持仓与停牌拒绝
+属于显式 adapter lowering；
 RQAlpha 使用清洗 OHLCV、实际成交量和原生交易状态检查。两者都将 `qfq/hfq`
 公司行动视为已嵌入价格。`adjustment=none` 时，VectorBT 通过 pre-segment 回调
 在同日订单前改变现金/持仓；RQAlpha 通过 DataSource 的原生分红和拆并股接口
@@ -214,7 +235,6 @@ RQAlpha 的到账日被规范为除权日；红利税、实际到账延迟、碎
 
 RQAlpha 默认通过独立模块复算当前支持的固定权重和动量策略，不导入参考
 `strategies.py`、`risk.py` 或 `backtest.py`；旧的 `frozen_orders` 模式只用于执行
-诊断。目标整手、换手率和现金缓冲仍是适配层规则，VectorBT 的可买数量及企业
-行动状态变化也仍是 adapter lowering。下一阶段需要支持非零初始持仓和真实证券
-主数据映射，为需要拟合的模型实现逐折训练，并用真实且有使用权的数据做容量
-复核。
+诊断。目标整手、换手率和现金缓冲仍是适配层规则，VectorBT 的可买数量、初始
+持仓和企业行动状态变化也仍是 adapter lowering。下一阶段需要接入真实证券主
+数据映射，为需要拟合的模型实现逐折训练，并用真实且有使用权的数据做容量复核。

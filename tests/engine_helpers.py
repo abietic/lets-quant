@@ -28,6 +28,7 @@ def build_curated_reference(
     suspension_date: str = "2025-01-03",
     include_corporate_action: bool = True,
     corporate_action_rows: Optional[List[Dict[str, str]]] = None,
+    initial_holdings_path: Optional[Path] = None,
 ) -> Dict[str, Path]:
     temporary.mkdir(parents=True, exist_ok=True)
     bars_path = temporary / "bars.csv"
@@ -132,8 +133,7 @@ def build_curated_reference(
             str(temporary / "curated"),
         ]
     )
-    reference = _run_json(
-        [
+    reference_args = [
             "backtest",
             "--policy",
             str(ROOT / "config/policy.cn-etf.example.json"),
@@ -142,7 +142,11 @@ def build_curated_reference(
             "--output-root",
             str(temporary / "reference"),
         ]
-    )
+    if initial_holdings_path is not None:
+        reference_args.extend(
+            ["--initial-holdings", str(initial_holdings_path)]
+        )
+    reference = _run_json(reference_args)
     return {
         "dataset": Path(str(curated["dataset_directory"])),
         "reference": Path(str(reference["artifact_directory"])),

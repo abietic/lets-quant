@@ -15,6 +15,7 @@
 - 单标的权重、总暴露、单次换手率和最大回撤风险约束。
 - 现金、静态目标权重和基准三类比较。
 - 带原始快照、清洗数据集和配置哈希的回测产物。
+- 可选且纳入哈希的初始持仓快照，首日现金、持仓和企业行动进入同一账本。
 - train/validation/test 时间隔离、成本与成交延迟压力实验。
 - 多个滚动时间折和邻近策略参数敏感性矩阵，不自动选择最优参数。
 - 带严格输入指纹和差异报告的跨引擎候选产物契约与对账器。
@@ -76,7 +77,8 @@ train/validation/test 三段时间隔离和三组执行压力场景。它只证�
 ```bash
 PYTHONPATH=src python3 -m lets_quant backtest \
   --policy config/policy.example.json \
-  --prices examples/prices.csv
+  --prices examples/prices.csv \
+  --initial-holdings examples/holdings.csv
 
 PYTHONPATH=src python3 -m lets_quant plan-orders \
   --policy config/policy.example.json \
@@ -101,6 +103,8 @@ PYTHONPATH=src python3 -m lets_quant backtest \
 
 - `manifest.json`：输入路径、逐文件 SHA-256、源码版本、Python 版本和模型假设。
 - `policy.snapshot.json`：本次运行使用的完整策略快照。
+- `initial_holdings.csv`：规范化、参与运行身份的首日企业行动前持仓；未传入时
+  仍写入只有表头的空快照。
 - `metrics.json`：收益、波动、夏普、回撤、费用、换手率和基准指标。
 - `nav.csv`：每日净值、现金、持仓和风险冻结状态。
 - `signals.csv`：信号、稳定 decision ID、目标权重、决策证据、风险判断和
@@ -114,6 +118,11 @@ PYTHONPATH=src python3 -m lets_quant backtest \
 少于 252 个交易日时，结果会写入短样本警告；这时年化收益、波动率和夏普
 比率不能作为决策依据。即使目录尚未初始化 Git，manifest 也会记录 Python
 源码树的 SHA-256。
+
+`--initial-holdings` 只接受策略标的内的非负整手多头持仓。配置中的
+`portfolio.initial_cash` 仍是实际现金，持仓市值在其上额外计入首日 NAV；现金、
+静态目标权重和基准三类比较都从该首日 NAV 起算。首日若有未复权企业行动，
+先登记导入持仓，再处理分红或拆并股。碎股、策略外持仓和做空持仓会失败关闭。
 
 `plan-orders` 会在 `artifacts/plans/<plan-id>/` 中生成订单建议。输出始终包含：
 
@@ -215,10 +224,17 @@ RQAlpha 的成交数量和生命周期由引擎原生生成；现金缓冲的暂
 映射。`validate-rqalpha` 默认使用 `independent_policy`；诊断旧执行链路时可显式
 传入 `--decision-mode frozen_orders`，但该模式不会验证策略决策。VectorBT 仍只
 重放冻结订单意图。两个适配器支持绑定哈希的独立 CSV 和质量通过的清洗日线
-数据集，并复核停牌拒绝；仍只支持零初始持仓和只做多。复权数据中的公司行动
-按“已嵌入价格”处理；未复权现金分红和可保持整股的拆并股会进入独立事件证据，
+数据集，并复核停牌拒绝；支持绑定快照的整手非零初始持仓，但仍只做多。复权
+数据中的公司行动按“已嵌入价格”处理；未复权现金分红和可保持整股的拆并股会
+进入独立事件证据，
 跨越拆并股的待执行订单会因数量过期而拒绝。VectorBT 通过适配器回调改变模拟
 状态，RQAlpha 使用原生分红/拆并股账户路径。
+
+VectorBT 的初始持仓通过首个 segment 回调注入；RQAlpha 使用原生
+`init_positions`。为让 RQAlpha 在运行首日正确筛选企业行动，适配器添加一个仅供
+账户初始化的首日前哨日，并使用首日收盘估值；该前哨日不会进入策略历史、NAV
+日期轴或候选信号。
+
 完整契约与扩展方法见
 [跨引擎验证](docs/CROSS_ENGINE_VALIDATION.md)。
 
@@ -357,6 +373,7 @@ AKShare 的 MIT 许可是代码许可，不等于其上游行情的再分发或�
 - 未复权拆并股跨越信号日和执行日时，原订单数量会被标记为过期并拒绝，等待
   下一次策略决策重新计算，不猜测真实柜台的改单规则。
 - 暂不处理碎股现金替代、代码变更、红利税批次或复杂公司行动顺序。
+- 初始持仓必须是策略范围内的整手多头；这不是券商账户导入或恢复真相源。
 - 使用复权价格时，整手数量和交易成本是研究近似值，不能解释成历史可成交
   数量或真实费用。
 - 不处理融资、融券、期权、期货或杠杆。

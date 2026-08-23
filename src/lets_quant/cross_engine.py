@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 NAV_FIELDS = ["date", "nav", "cash", "positions"]
 TRADE_FIELDS = [
     "signal_date",
@@ -1218,6 +1218,15 @@ def reference_identity(reference_directory: Path) -> Dict[str, Any]:
                 f"reference artifact integrity failed for {name}: expected "
                 f"{expected_hash}, got {actual_hash}"
             )
+    initial_holdings_hash = declared_hashes.get("initial_holdings.csv")
+    if (
+        initial_holdings_hash is not None
+        and manifest.get("initial_holdings_snapshot_sha256")
+        != initial_holdings_hash
+    ):
+        raise EngineValidationError(
+            f"{manifest_path} initial holdings snapshot hash is inconsistent"
+        )
     required = [
         "policy.snapshot.json",
         "ledger.csv",
@@ -1250,6 +1259,7 @@ def reference_identity(reference_directory: Path) -> Dict[str, Any]:
         "prices_input_sha256": prices_input_hash,
         "policy_snapshot_sha256": file_hashes["policy.snapshot.json"],
         "ledger_sha256": file_hashes["ledger.csv"],
+        "initial_holdings_sha256": initial_holdings_hash,
         "metrics_sha256": file_hashes["metrics.json"],
         "nav_sha256": file_hashes["nav.csv"],
         "signals_sha256": file_hashes["signals.csv"],

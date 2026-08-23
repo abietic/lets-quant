@@ -26,6 +26,7 @@ from .engine_inputs import (
     EngineBar,
     load_frozen_order_intents,
     load_json_object,
+    load_reference_initial_positions,
     resolve_engine_market_input,
 )
 from .independent_policy import (
@@ -35,7 +36,7 @@ from .independent_policy import (
 from .models import CorporateAction, Policy
 
 
-ADAPTER_VERSION = "4"
+ADAPTER_VERSION = "5"
 SUPPORTED_RQALPHA_VERSION = "6.3.0"
 CHINA_TIMEZONE = timezone(timedelta(hours=8))
 DECISION_MODES = {"independent_policy", "frozen_orders"}
@@ -54,6 +55,7 @@ class _RuntimeContext:
     tradable_by_date: Dict[str, Dict[str, bool]]
     corporate_actions_by_date: Dict[str, List[CorporateAction]]
     price_adjustment: str
+    initial_positions: Dict[str, int]
     volumes: Dict[str, Dict[str, int]]
     lot_size: int
     cash_buffer_weight: float
@@ -181,7 +183,10 @@ class _FrozenDailyDataSource:
         self._runtime = runtime
         first_date = date.fromisoformat(runtime.trading_dates[0])
         last_date = date.fromisoformat(runtime.trading_dates[-1])
-        self._calendar = pd.DatetimeIndex(runtime.trading_dates)
+        self._opening_sentinel_date = (first_date - timedelta(days=1)).isoformat()
+        self._calendar = pd.DatetimeIndex(
+            [self._opening_sentinel_date, *runtime.trading_dates]
+        )
         self._instruments: Dict[str, Any] = {}
         self._aliases: Dict[str, Any] = {}
         for symbol in runtime.symbols:
@@ -246,10 +251,15 @@ class _FrozenDailyDataSource:
         original = self._runtime.original_symbols.get(mapped_symbol)
         if original is None:
             return None
-        source_bar = self._runtime.market_bars.get(trading_date, {}).get(original)
+        source_date = (
+            self._runtime.trading_dates[0]
+            if trading_date == self._opening_sentinel_date
+            else trading_date
+        )
+        source_bar = self._runtime.market_bars.get(source_date, {}).get(original)
         if source_bar is None:
             return None
-        volume = self._runtime.volumes[trading_date][original]
+        volume = self._runtime.volumes[source_date][original]
         return {
             "datetime": int(trading_date.replace("-", "")) * 1_000_000,
             "open": source_bar.open,
@@ -614,7 +624,7 @@ class _LetsQuantRqalphaMod:
         previous_positions = (
             dict(self._runtime.nav_rows[-1]["positions"])
             if self._runtime.nav_rows
-            else {symbol: 0 for symbol in self._runtime.symbols}
+            else dict(self._runtime.initial_positions)
         )
         previous_cash = (
             float(self._runtime.nav_rows[-1]["cash"])
@@ -1149,7 +1159,7 @@ def run_rqalpha_validation(
         reference_directory,
         supplied_prices_path=prices_path,
         supplied_dataset_path=dataset_path,
-        adapter_name="RQAlpha adapter v4",
+        adapter_name="RQAlpha adapter v5",
     )
     reference_metrics = load_json_object(
         reference_directory / "metrics.json"
@@ -1166,16 +1176,20 @@ def run_rqalpha_validation(
         )
     market = market_input.market
     symbols = sorted(policy.strategy.target_weights)
+    initial_positions, initial_holdings_sha256 = (
+        load_reference_initial_positions(
+            reference_directory,
+            symbols=symbols,
+            lot_size=policy.execution.lot_size,
+            adapter_name="RQAlpha adapter v5",
+        )
+    )
     validate_market_coverage(market, symbols)
     reference_nav = read_nav_rows(reference_directory / "nav.csv")
     trading_dates = [row["date"] for row in reference_nav]
     if set(reference_nav[0]["positions"]) != set(symbols):
         raise EngineValidationError(
             "reference starting positions must contain exactly the strategy symbols"
-        )
-    if any(reference_nav[0]["positions"].values()):
-        raise EngineValidationError(
-            "RQAlpha adapter v4 supports zero starting positions only"
         )
     market_prices = {
         trading_date.isoformat(): {
@@ -1196,7 +1210,7 @@ def run_rqalpha_validation(
             symbols=symbols,
             trading_dates=trading_dates,
             market_prices=market_prices,
-            adapter_name="RQAlpha adapter v4 frozen-orders mode",
+            adapter_name="RQAlpha adapter v5 frozen-orders mode",
         )
     else:
         intents = []
@@ -1249,6 +1263,7 @@ def run_rqalpha_validation(
             for trading_date in trading_dates
         },
         price_adjustment=market.price_adjustment,
+        initial_positions=initial_positions,
         volumes=volumes,
         lot_size=policy.execution.lot_size,
         cash_buffer_weight=policy.portfolio.cash_buffer_weight,
@@ -1258,7 +1273,7 @@ def run_rqalpha_validation(
         execution_delay_trading_days=execution_delay,
         intents=intents,
         pending_intents=list(intents),
-        peak_nav=policy.portfolio.initial_cash,
+        peak_nav=0.0,
     )
     runtime_id = uuid.uuid4().hex
     _RUNTIMES[runtime_id] = runtime
@@ -1270,7 +1285,11 @@ def run_rqalpha_validation(
             "end_date": trading_dates[-1],
             "frequency": "1d",
             "accounts": {"stock": policy.portfolio.initial_cash},
-            "init_positions": {},
+            "init_positions": ",".join(
+                f"{mapped_symbols[symbol]}:{quantity}"
+                for symbol, quantity in sorted(initial_positions.items())
+                if quantity > 0
+            ),
             "capital_gain_tax_rate": 0,
             "partial_fill_on_insufficient_cash": True,
         },
@@ -1359,6 +1378,10 @@ def run_rqalpha_validation(
             if market_input.source_type == "curated_dataset"
             else "all_observations_tradable"
         ),
+        "initial_holdings_sha256": initial_holdings_sha256,
+        "initial_position_count": sum(
+            1 for quantity in initial_positions.values() if quantity > 0
+        ),
     }
     if market_input.dataset_manifest is not None:
         market_scope.update(
@@ -1420,6 +1443,7 @@ def run_rqalpha_validation(
                 "cancellation",
                 "commission, sell tax, slippage, positions, cash, and valuation",
                 "cash-dividend credits and integral split position changes",
+                "long-only opening positions initialized by the account model",
             ],
             "adapter_mapped_components": [
                 "synthetic RQAlpha instrument identifiers",
@@ -1429,6 +1453,8 @@ def run_rqalpha_validation(
                 "standalone closes mapped to flat OHLC or curated OHLCV bars",
                 "curated suspension state mapped to RQAlpha tradability checks",
                 "cross-action pending intent invalidation before submission",
+                "a pre-start calendar sentinel valued at the first close for "
+                "native opening-position initialization",
             ],
             "excluded_components": [
                 "market data correctness and provider lineage",
@@ -1444,9 +1470,9 @@ def run_rqalpha_validation(
         limitations=[
             "Parity validates software behavior for this frozen input only; it "
             "does not establish strategy or investment validity.",
-            "Adapter v4 accepts standalone prices or validated curated daily "
-            "datasets, long-only runs with zero starting positions, and at "
-            "most one order per symbol/date.",
+            "Adapter v5 accepts standalone prices or validated curated daily "
+            "datasets, long-only opening positions inside the strategy scope, "
+            "and at most one order per symbol/date.",
             "Adjusted datasets keep declared actions informational; unadjusted "
             "cash dividends and integral split results use RQAlpha's native "
             "account model.",

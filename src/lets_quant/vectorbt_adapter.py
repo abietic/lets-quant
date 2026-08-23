@@ -22,11 +22,12 @@ from .cross_engine import (
 from .data import validate_market_coverage
 from .engine_inputs import (
     load_frozen_order_intents,
+    load_reference_initial_positions,
     resolve_engine_market_input,
 )
 
 
-ADAPTER_VERSION = "3"
+ADAPTER_VERSION = "4"
 SUPPORTED_VECTORBT_VERSION = "1.1.0"
 
 def run_vectorbt_validation(
@@ -66,10 +67,18 @@ def run_vectorbt_validation(
         reference_directory,
         supplied_prices_path=prices_path,
         supplied_dataset_path=dataset_path,
-        adapter_name="VectorBT adapter v3",
+        adapter_name="VectorBT adapter v4",
     )
     market = market_input.market
     symbols = sorted(policy.strategy.target_weights)
+    initial_positions, initial_holdings_sha256 = (
+        load_reference_initial_positions(
+            reference_directory,
+            symbols=symbols,
+            lot_size=policy.execution.lot_size,
+            adapter_name="VectorBT adapter v4",
+        )
+    )
     validate_market_coverage(market, symbols)
     reference_nav = read_nav_rows(reference_directory / "nav.csv")
     trading_dates = [row["date"] for row in reference_nav]
@@ -77,10 +86,6 @@ def run_vectorbt_validation(
         raise EngineValidationError(
             "reference starting positions must contain exactly the strategy "
             "symbols"
-        )
-    if any(reference_nav[0]["positions"].values()):
-        raise EngineValidationError(
-            "VectorBT adapter v3 supports zero starting positions only"
         )
     market_prices: Dict[str, Dict[str, float]] = {
         trading_date.isoformat(): {
@@ -100,7 +105,7 @@ def run_vectorbt_validation(
         symbols=symbols,
         trading_dates=trading_dates,
         market_prices=market_prices,
-        adapter_name="VectorBT adapter v3",
+        adapter_name="VectorBT adapter v4",
     )
 
     close = pd.DataFrame(
@@ -242,6 +247,14 @@ def run_vectorbt_validation(
 
     def pre_segment_function(context: Any) -> Tuple[()]:
         trading_date = trading_dates[context.i]
+        if context.i == 0:
+            for symbol, quantity in initial_positions.items():
+                column_index = symbol_indexes[symbol]
+                if float(context.last_position[column_index]) != 0:
+                    raise EngineValidationError(
+                        "VectorBT initial position state is not empty"
+                    )
+                context.last_position[column_index] = quantity
         for action in actions_by_date[trading_date]:
             column_index = symbol_indexes.get(action.symbol)
             quantity_before = (
@@ -496,6 +509,10 @@ def run_vectorbt_validation(
             if market_input.source_type == "curated_dataset"
             else "all_observations_tradable"
         ),
+        "initial_holdings_sha256": initial_holdings_sha256,
+        "initial_position_count": sum(
+            1 for quantity in initial_positions.values() if quantity > 0
+        ),
     }
     if market_input.dataset_manifest is not None:
         market_scope.update(
@@ -545,6 +562,7 @@ def run_vectorbt_validation(
                 "commission minimum, sell-tax split, and symmetric slippage",
                 "cash dividends, splits, reverse splits, and stale-intent "
                 "rejection applied before same-day orders",
+                "opening positions injected before first-day actions and orders",
             ],
             "excluded_components": [
                 "strategy signal generation and point-in-time feature logic",
@@ -557,9 +575,9 @@ def run_vectorbt_validation(
         limitations=[
             "Parity validates software behavior for this frozen input only; it "
             "does not establish strategy or investment validity.",
-            "Adapter v3 accepts standalone prices or validated curated daily "
-            "datasets, long-only runs with zero starting positions, and at "
-            "most one order per symbol/date.",
+            "Adapter v4 accepts standalone prices or validated curated daily "
+            "datasets, long-only opening positions inside the strategy scope, "
+            "and at most one order per symbol/date.",
             "Curated tradability rejection is adapter logic; VectorBT does not "
             "natively model suspensions in this integration.",
             "Corporate actions mutate VectorBT simulation state through adapter "

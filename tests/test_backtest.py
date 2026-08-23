@@ -2,11 +2,81 @@ import unittest
 from datetime import date
 
 from lets_quant.backtest import run_backtest
+from lets_quant.models import CorporateAction, Holding
+from lets_quant.strategies import StrategyError
 
 from tests.helpers import make_market, make_policy
 
 
 class BacktestTest(unittest.TestCase):
+    def test_nonzero_initial_holdings_are_ledgered_before_first_day_actions(
+        self,
+    ) -> None:
+        trading_dates = [date(2025, 1, 2), date(2025, 1, 3)]
+        market = make_market(
+            trading_dates,
+            [{"AAA": 5.0}, {"AAA": 5.5}],
+            corporate_actions_by_date={
+                trading_dates[0]: [
+                    CorporateAction(
+                        symbol="AAA",
+                        event_type="split",
+                        ex_date=trading_dates[0],
+                        ratio=2.0,
+                    )
+                ]
+            },
+        )
+        policy = make_policy(
+            initial_cash=1_000,
+            weights={"AAA": 0.5},
+            max_single_weight=1.0,
+            max_gross_exposure=1.0,
+        )
+
+        result = run_backtest(
+            policy,
+            market,
+            initial_holdings=[Holding(symbol="AAA", quantity=100)],
+        )
+
+        self.assertEqual(result.nav[0].cash, 1_000)
+        self.assertEqual(result.nav[0].positions, {"AAA": 200})
+        self.assertEqual(result.nav[0].nav, 2_000)
+        self.assertEqual(
+            [entry.event_type for entry in result.ledger[:3]],
+            ["initial_cash", "initial_position", "split"],
+        )
+        self.assertEqual(
+            result.metrics["baselines"]["cash"]["total_return"], 0.0
+        )
+
+    def test_initial_holdings_outside_strategy_scope_fail_closed(self) -> None:
+        market = make_market(
+            [date(2025, 1, 2), date(2025, 1, 3)],
+            [{"AAA": 10.0}, {"AAA": 10.0}],
+        )
+
+        with self.assertRaisesRegex(StrategyError, "outside the strategy scope"):
+            run_backtest(
+                make_policy(),
+                market,
+                initial_holdings=[Holding(symbol="OTHER", quantity=1)],
+            )
+
+    def test_fractional_lot_initial_holding_fails_closed(self) -> None:
+        market = make_market(
+            [date(2025, 1, 2), date(2025, 1, 3)],
+            [{"AAA": 10.0}, {"AAA": 10.0}],
+        )
+
+        with self.assertRaisesRegex(StrategyError, "multiple of lot_size"):
+            run_backtest(
+                make_policy(lot_size=100),
+                market,
+                initial_holdings=[Holding(symbol="AAA", quantity=50)],
+            )
+
     def test_signal_executes_on_next_trading_day(self) -> None:
         dates = [
             date(2025, 1, 2),

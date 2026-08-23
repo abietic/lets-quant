@@ -7,6 +7,7 @@ from pathlib import Path
 from lets_quant.cross_engine import EngineValidationError
 from lets_quant.engine_inputs import (
     load_frozen_order_intents,
+    load_reference_initial_positions,
     resolve_engine_market_input,
 )
 
@@ -14,6 +15,39 @@ from tests.engine_helpers import build_curated_reference
 
 
 class EngineInputsTest(unittest.TestCase):
+    def test_initial_holdings_snapshot_declaration_must_match_file_hash(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            holdings_path = temporary / "holdings.csv"
+            holdings_path.write_text(
+                "symbol,quantity\n510300.XSHG,100\n",
+                encoding="utf-8",
+            )
+            fixture = build_curated_reference(
+                temporary / "fixture",
+                initial_holdings_path=holdings_path,
+            )
+            manifest_path = fixture["reference"] / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["initial_holdings_snapshot_sha256"] = "0" * 64
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                EngineValidationError,
+                "initial holdings snapshot hash is inconsistent",
+            ):
+                load_reference_initial_positions(
+                    fixture["reference"],
+                    symbols=["510300.XSHG", "511010.XSHG"],
+                    lot_size=100,
+                    adapter_name="test adapter",
+                )
+
     def test_curated_input_preserves_bound_ohlcv_and_tradability(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temporary = Path(temp_dir)

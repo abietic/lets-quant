@@ -152,6 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
     backtest_source = backtest.add_mutually_exclusive_group(required=True)
     backtest_source.add_argument("--prices", type=Path)
     backtest_source.add_argument("--dataset", type=Path)
+    backtest.add_argument("--initial-holdings", type=Path)
     backtest.add_argument(
         "--output-root", type=Path, default=Path("artifacts/runs")
     )
@@ -509,13 +510,22 @@ def _load_market_source(
 def _backtest(args: argparse.Namespace) -> int:
     policy = load_policy(args.policy)
     market, prices_path, dataset_manifest = _load_market_source(args, policy)
-    result = run_backtest(policy, market)
+    initial_holdings = (
+        load_holdings(args.initial_holdings)
+        if args.initial_holdings is not None
+        else []
+    )
+    result = run_backtest(
+        policy, market, initial_holdings=initial_holdings
+    )
     destination = write_backtest_artifacts(
         result,
         policy,
         args.policy,
         prices_path,
         args.output_root,
+        initial_holdings=initial_holdings,
+        initial_holdings_path=args.initial_holdings,
         dataset_manifest=dataset_manifest,
     )
     print(
