@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 NAV_FIELDS = ["date", "nav", "cash", "positions"]
 TRADE_FIELDS = [
     "signal_date",
@@ -78,6 +78,8 @@ EVENT_FIELDS = [
 FINAL_ORDER_STATUSES = {"FILLED", "CANCELLED", "REJECTED"}
 ORDER_STATUSES = FINAL_ORDER_STATUSES | {"PENDING_NEW", "ACTIVE"}
 ORDER_EVENT_TYPES = {
+    "order_precheck_reject",
+    "order_tradability_reject",
     "order_pending_new",
     "order_creation_pass",
     "order_creation_reject",
@@ -1346,9 +1348,15 @@ def _validate_order_lifecycle(
                     "actual": len(events),
                 }
             )
-        if events[0]["event_type"] != "order_pending_new" or events[0][
-            "order_status"
-        ] != "PENDING_NEW":
+        valid_initial_event = (
+            events[0]["event_type"] == "order_pending_new"
+            and events[0]["order_status"] == "PENDING_NEW"
+        ) or (
+            events[0]["event_type"]
+            in {"order_precheck_reject", "order_tradability_reject"}
+            and events[0]["order_status"] == "REJECTED"
+        )
+        if not valid_initial_event:
             mismatches.append(
                 {
                     "order_id": order_id,
@@ -1417,7 +1425,20 @@ def _validate_order_lifecycle(
                             "actual": event["cumulative_filled_quantity"],
                         }
                     )
-            if event_type == "order_pending_new":
+            if event_type in {
+                "order_precheck_reject",
+                "order_tradability_reject",
+            }:
+                if event_index != 0 or len(events) != 1 or status != "REJECTED":
+                    mismatches.append(
+                        {
+                            "order_id": order_id,
+                            "field": "precheck_reject_transition",
+                            "event_index": event_index,
+                        }
+                    )
+                final_seen = True
+            elif event_type == "order_pending_new":
                 if event_index != 0 or status != "PENDING_NEW":
                     mismatches.append(
                         {
@@ -1609,7 +1630,9 @@ def _validate_order_lifecycle(
             )
         else:
             expected_trade_status = (
-                "filled"
+                "rejected_not_tradable"
+                if events[0]["event_type"] == "order_tradability_reject"
+                else "filled"
                 if order["final_status"] == "FILLED"
                 and cumulative_fill == order["requested_quantity"]
                 else "partial"

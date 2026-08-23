@@ -11,6 +11,8 @@ from unittest.mock import patch
 
 from lets_quant.cli import main
 
+from tests.engine_helpers import build_curated_reference
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RQALPHA_AVAILABLE = importlib.util.find_spec("rqalpha") is not None
@@ -329,6 +331,80 @@ class RqalphaAdapterTest(unittest.TestCase):
                 signal_rows[1]["reason"],
                 "maximum drawdown risk freeze is active",
             )
+
+    def test_curated_ohlcv_suspension_uses_native_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            fixture = build_curated_reference(
+                temporary,
+                suspended_symbol="511010.XSHG",
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "validate-rqalpha",
+                        "--reference-run",
+                        str(fixture["reference"]),
+                        "--dataset",
+                        str(fixture["dataset"]),
+                        "--output-root",
+                        str(temporary / "candidate"),
+                    ]
+                )
+            payload = json.loads(stdout.getvalue())
+
+            self.assertEqual(exit_code, 0, payload)
+            self.assertEqual(payload["status"], "pass")
+            lifecycle = payload["summary"]["order_lifecycle"]
+            self.assertEqual(lifecycle["rejected_order_count"], 1)
+            candidate = Path(payload["candidate_directory"])
+            with (candidate / "trades.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                trades = list(csv.DictReader(handle))
+            rejected = [
+                trade
+                for trade in trades
+                if trade["status"] == "rejected_not_tradable"
+            ]
+            self.assertEqual(len(rejected), 1)
+            self.assertEqual(rejected[0]["symbol"], "511010.XSHG")
+            events = (candidate / "events.csv").read_text(encoding="utf-8")
+            self.assertIn("order_tradability_reject", events)
+            manifest = json.loads(
+                (candidate / "manifest.json").read_text(encoding="utf-8")
+            )
+            scope = manifest["validation_scope"]
+            self.assertEqual(scope["bar_mapping"], "curated_ohlcv")
+
+    def test_unadjusted_corporate_actions_fail_before_simulation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            fixture = build_curated_reference(
+                temporary,
+                adjustment="none",
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                stderr
+            ):
+                exit_code = main(
+                    [
+                        "validate-rqalpha",
+                        "--reference-run",
+                        str(fixture["reference"]),
+                        "--dataset",
+                        str(fixture["dataset"]),
+                        "--output-root",
+                        str(temporary / "candidate"),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("corporate-action accounting", stderr.getvalue())
 
     def test_zero_affordable_quantity_is_a_native_rejection(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

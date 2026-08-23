@@ -21,11 +21,13 @@ from .cross_engine import (
     write_engine_candidate,
     write_reconciliation_report,
 )
-from .data import load_prices, validate_market_coverage
+from .data import validate_market_coverage
 from .engine_inputs import (
+    EngineBar,
     load_frozen_order_intents,
     load_json_object,
-    resolve_standalone_prices_path,
+    reject_unsupported_unadjusted_actions,
+    resolve_engine_market_input,
 )
 from .independent_policy import (
     IndependentPolicyError,
@@ -34,7 +36,7 @@ from .independent_policy import (
 from .models import Policy
 
 
-ADAPTER_VERSION = "2"
+ADAPTER_VERSION = "3"
 SUPPORTED_RQALPHA_VERSION = "6.3.0"
 CHINA_TIMEZONE = timezone(timedelta(hours=8))
 DECISION_MODES = {"independent_policy", "frozen_orders"}
@@ -49,6 +51,8 @@ class _RuntimeContext:
     mapped_symbols: Dict[str, str]
     original_symbols: Dict[str, str]
     market_prices: Dict[str, Dict[str, float]]
+    market_bars: Dict[str, Dict[str, EngineBar]]
+    tradable_by_date: Dict[str, Dict[str, bool]]
     volumes: Dict[str, Dict[str, int]]
     lot_size: int
     cash_buffer_weight: float
@@ -63,6 +67,7 @@ class _RuntimeContext:
     nav_rows: List[Dict[str, Any]] = field(default_factory=list)
     peak_nav: float = 0.0
     risk_frozen: bool = False
+    submitting_intent: Optional[Dict[str, Any]] = None
 
 
 _RUNTIMES: Dict[str, _RuntimeContext] = {}
@@ -88,10 +93,14 @@ def _load_liquidity(
     *,
     trading_dates: Sequence[str],
     symbols: Sequence[str],
+    default_volumes: Mapping[str, Mapping[str, int]],
 ) -> Tuple[Dict[str, Dict[str, int]], Optional[str]]:
     if path is None:
         return {
-            trading_date: {symbol: 10**12 for symbol in symbols}
+            trading_date: {
+                symbol: int(default_volumes[trading_date][symbol])
+                for symbol in symbols
+            }
             for trading_date in trading_dates
         }, None
 
@@ -235,20 +244,20 @@ class _FrozenDailyDataSource:
         original = self._runtime.original_symbols.get(mapped_symbol)
         if original is None:
             return None
-        close = self._runtime.market_prices.get(trading_date, {}).get(original)
-        if close is None:
+        source_bar = self._runtime.market_bars.get(trading_date, {}).get(original)
+        if source_bar is None:
             return None
         volume = self._runtime.volumes[trading_date][original]
         return {
             "datetime": int(trading_date.replace("-", "")) * 1_000_000,
-            "open": close,
-            "high": close,
-            "low": close,
-            "close": close,
+            "open": source_bar.open,
+            "high": source_bar.high,
+            "low": source_bar.low,
+            "close": source_bar.close,
             "volume": volume,
-            "total_turnover": close * volume,
-            "limit_up": close * 10.0,
-            "limit_down": close * 0.1,
+            "total_turnover": source_bar.close * volume,
+            "limit_up": source_bar.close * 10.0,
+            "limit_down": source_bar.close * 0.1,
             "settlement": self._np.nan,
             "prev_settlement": self._np.nan,
             "open_interest": 0.0,
@@ -365,8 +374,9 @@ class _FrozenDailyDataSource:
         if original is None:
             return [True] * len(dates)
         return [
-            self._runtime.volumes.get(self._date_key(value), {}).get(original, 0)
-            == 0
+            not self._runtime.tradable_by_date.get(
+                self._date_key(value), {}
+            ).get(original, False)
             for value in dates
         ]
 
@@ -426,6 +436,47 @@ class _LetsQuantRqalphaMod:
                 raise RuntimeError("RQAlpha collector is not initialized")
             order = getattr(event, "order", None)
             if order is None:
+                if event_type == "order_creation_reject":
+                    intent = self._runtime.submitting_intent
+                    mapped = str(getattr(event, "order_book_id", ""))
+                    if (
+                        intent is None
+                        or self._runtime.mapped_symbols[intent["symbol"]]
+                        != mapped
+                    ):
+                        raise RuntimeError(
+                            "RQAlpha precheck rejection cannot be bound to "
+                            "the submitting intent"
+                        )
+                    self._runtime.events.append(
+                        {
+                            "sequence": len(self._runtime.events) + 1,
+                            "event_time": _event_time(self._env.calendar_dt),
+                            "event_type": (
+                                "order_tradability_reject"
+                                if not self._runtime.tradable_by_date[
+                                    intent["execution_date"]
+                                ][intent["symbol"]]
+                                else "order_precheck_reject"
+                            ),
+                            "order_id": (
+                                "rqalpha-precheck-"
+                                f"{int(intent['sequence']) + 1}"
+                            ),
+                            "trade_id": "",
+                            "symbol": intent["symbol"],
+                            "side": intent["side"],
+                            "requested_quantity": int(intent["quantity"]),
+                            "cumulative_filled_quantity": 0,
+                            "event_fill_quantity": 0,
+                            "order_status": "REJECTED",
+                            "fill_price": 0.0,
+                            "commission": 0.0,
+                            "tax": 0.0,
+                            "message": str(getattr(event, "reason", "")),
+                        }
+                    )
+                    return
                 raise RuntimeError(
                     f"RQAlpha emitted {event_type} without an order object"
                 )
@@ -588,22 +639,28 @@ def _submit_intent(
 
     mapped = runtime.mapped_symbols[str(intent["symbol"])]
     amount = int(intent["quantity"])
-    if intent["side"] == "SELL":
-        order_shares(mapped, -amount)
-        return
-    reserve = max(
-        0.0,
-        float(context.portfolio.total_value)
-        * runtime.cash_buffer_weight,
-    )
-    reserved_cash = min(reserve, max(0.0, float(context.portfolio.cash)))
-    if reserved_cash > 0:
-        withdraw("STOCK", reserved_cash)
+    runtime.submitting_intent = dict(intent)
     try:
-        order_shares(mapped, amount)
-    finally:
+        if intent["side"] == "SELL":
+            order_shares(mapped, -amount)
+            return
+        reserve = max(
+            0.0,
+            float(context.portfolio.total_value)
+            * runtime.cash_buffer_weight,
+        )
+        reserved_cash = min(
+            reserve, max(0.0, float(context.portfolio.cash))
+        )
         if reserved_cash > 0:
-            deposit("STOCK", reserved_cash)
+            withdraw("STOCK", reserved_cash)
+        try:
+            order_shares(mapped, amount)
+        finally:
+            if reserved_cash > 0:
+                deposit("STOCK", reserved_cash)
+    finally:
+        runtime.submitting_intent = None
 
 
 def _strategy_handle_bar(context: Any, bar_dict: Any) -> None:
@@ -746,18 +803,28 @@ def _normalize_engine_results(
         market_price = runtime.market_prices[intent["execution_date"]][
             intent["symbol"]
         ]
+        is_non_tradable = not runtime.tradable_by_date[
+            intent["execution_date"]
+        ][intent["symbol"]]
         if filled_quantity == 0:
-            fill_price = market_price * (
-                1.0 + runtime.slippage_fraction
-                if intent["side"] == "BUY"
-                else 1.0 - runtime.slippage_fraction
+            fill_price = (
+                market_price
+                if is_non_tradable
+                else market_price
+                * (
+                    1.0 + runtime.slippage_fraction
+                    if intent["side"] == "BUY"
+                    else 1.0 - runtime.slippage_fraction
+                )
             )
             slippage = 0.0
         else:
             fill_price = avg_fill_price
             slippage = abs(fill_price - market_price) * filled_quantity
         status = (
-            "filled"
+            "rejected_not_tradable"
+            if filled_quantity == 0 and is_non_tradable
+            else "filled"
             if final_status == "FILLED"
             and filled_quantity == intent["quantity"]
             else "partial"
@@ -786,9 +853,26 @@ def _normalize_engine_results(
             f"RQAlpha did not emit orders for candidate intents: {missing[:5]}"
         )
     sequence_order = sorted(order_rows_by_sequence)
+    date_order = {
+        trading_date: index
+        for index, trading_date in enumerate(runtime.trading_dates)
+    }
+    trade_order = sorted(
+        trade_rows_by_sequence,
+        key=lambda sequence: (
+            date_order[
+                trade_rows_by_sequence[sequence]["execution_date"]
+            ],
+            0
+            if trade_rows_by_sequence[sequence]["status"]
+            == "rejected_not_tradable"
+            else 1,
+            sequence,
+        ),
+    )
     return (
         [order_rows_by_sequence[index] for index in sequence_order],
-        [trade_rows_by_sequence[index] for index in sequence_order],
+        [trade_rows_by_sequence[index] for index in trade_order],
     )
 
 
@@ -797,6 +881,7 @@ def run_rqalpha_validation(
     reference_directory: Path,
     output_root: Path,
     prices_path: Optional[Path] = None,
+    dataset_path: Optional[Path] = None,
     liquidity_path: Optional[Path] = None,
     decision_mode: str = "independent_policy",
     volume_percent: float = 1.0,
@@ -833,12 +918,16 @@ def run_rqalpha_validation(
 
     reference_directory = reference_directory.resolve()
     reference_identity(reference_directory)
-    resolved_prices_path, reference_manifest = resolve_standalone_prices_path(
-        reference_directory,
-        prices_path,
-        adapter_name="RQAlpha adapter v2",
-    )
     policy = load_policy(reference_directory / "policy.snapshot.json")
+    market_input = resolve_engine_market_input(
+        reference_directory,
+        supplied_prices_path=prices_path,
+        supplied_dataset_path=dataset_path,
+        adapter_name="RQAlpha adapter v3",
+    )
+    reject_unsupported_unadjusted_actions(
+        market_input, adapter_name="RQAlpha adapter v3"
+    )
     reference_metrics = load_json_object(
         reference_directory / "metrics.json"
     )
@@ -852,7 +941,7 @@ def run_rqalpha_validation(
             "reference metrics must declare a positive integer "
             "execution_delay_trading_days"
         )
-    market = load_prices(resolved_prices_path)
+    market = market_input.market
     symbols = sorted(policy.strategy.target_weights)
     validate_market_coverage(market, symbols)
     reference_nav = read_nav_rows(reference_directory / "nav.csv")
@@ -863,7 +952,7 @@ def run_rqalpha_validation(
         )
     if any(reference_nav[0]["positions"].values()):
         raise EngineValidationError(
-            "RQAlpha adapter v2 supports zero starting positions only"
+            "RQAlpha adapter v3 supports zero starting positions only"
         )
     market_prices = {
         trading_date.isoformat(): {
@@ -884,14 +973,26 @@ def run_rqalpha_validation(
             symbols=symbols,
             trading_dates=trading_dates,
             market_prices=market_prices,
-            adapter_name="RQAlpha adapter v2 frozen-orders mode",
+            adapter_name="RQAlpha adapter v3 frozen-orders mode",
         )
     else:
         intents = []
+    default_volumes = {
+        trading_date: {
+            symbol: (
+                market_input.bars_by_date[trading_date][symbol].volume
+                if market_input.bars_by_date[trading_date][symbol].tradable
+                else 0
+            )
+            for symbol in symbols
+        }
+        for trading_date in trading_dates
+    }
     volumes, liquidity_sha256 = _load_liquidity(
         liquidity_path,
         trading_dates=trading_dates,
         symbols=symbols,
+        default_volumes=default_volumes,
     )
     mapped_symbols = {
         symbol: _mapped_symbol(index) for index, symbol in enumerate(symbols)
@@ -902,6 +1003,22 @@ def run_rqalpha_validation(
         mapped_symbols=mapped_symbols,
         original_symbols={mapped: symbol for symbol, mapped in mapped_symbols.items()},
         market_prices=market_prices,
+        market_bars={
+            trading_date: {
+                symbol: market_input.bars_by_date[trading_date][symbol]
+                for symbol in symbols
+            }
+            for trading_date in trading_dates
+        },
+        tradable_by_date={
+            trading_date: {
+                symbol: market_input.bars_by_date[trading_date][
+                    symbol
+                ].tradable
+                for symbol in symbols
+            }
+            for trading_date in trading_dates
+        },
         volumes=volumes,
         lot_size=policy.execution.lot_size,
         cash_buffer_weight=policy.portfolio.cash_buffer_weight,
@@ -953,7 +1070,7 @@ def run_rqalpha_validation(
             "sys_risk": {
                 "enabled": True,
                 "validate_price": True,
-                "validate_is_trading": False,
+                "validate_is_trading": True,
                 "validate_cash": True,
                 "validate_self_trade": False,
             },
@@ -996,6 +1113,33 @@ def run_rqalpha_validation(
         )
     order_rows, trade_rows = _normalize_engine_results(runtime)
     metrics = summarize_candidate(runtime.nav_rows, trade_rows)
+    market_scope: Dict[str, Any] = {
+        "reference_data_source": market_input.source_type,
+        "prices_sha256": file_sha256(market_input.prices_path),
+        "price_adjustment": market.price_adjustment,
+        "bar_mapping": (
+            "curated_ohlcv"
+            if market_input.source_type == "curated_dataset"
+            else "close_to_flat_ohlc"
+        ),
+        "tradability_source": (
+            "curated_observations"
+            if market_input.source_type == "curated_dataset"
+            else "all_observations_tradable"
+        ),
+    }
+    if market_input.dataset_manifest is not None:
+        market_scope.update(
+            {
+                "dataset_id": market_input.dataset_manifest["dataset_id"],
+                "dataset_snapshot_sha256": (
+                    market_input.dataset_snapshot_sha256
+                ),
+                "observations_sha256": market_input.dataset_manifest[
+                    "files"
+                ]["observations.csv"],
+            }
+        )
     candidate_directory = write_engine_candidate(
         reference_directory=reference_directory,
         output_root=output_root,
@@ -1046,15 +1190,16 @@ def run_rqalpha_validation(
                 "policy strategy semantics, target-lot sizing, turnover gate, "
                 "and sell-before-buy submission",
                 "dynamic cash-buffer withdrawal and immediate redeposit",
-                "standalone close prices mapped to flat OHLC daily bars",
+                "standalone closes mapped to flat OHLC or curated OHLCV bars",
+                "curated suspension state mapped to RQAlpha tradability checks",
             ],
             "excluded_components": [
                 "market data correctness and provider lineage",
-                "curated tradability, corporate actions, and adjusted-price semantics",
+                "unadjusted corporate-action accounting",
+                "correctness of adjusted-price factors",
                 "real order books, queue priority, and intraday execution",
             ],
-            "reference_data_source": reference_manifest["data_source"]["type"],
-            "prices_sha256": file_sha256(resolved_prices_path),
+            **market_scope,
             "liquidity_sha256": liquidity_sha256,
             "volume_percent": volume_percent,
             "decision_mode": decision_mode,
@@ -1063,8 +1208,11 @@ def run_rqalpha_validation(
         limitations=[
             "Parity validates software behavior for this frozen input only; it "
             "does not establish strategy or investment validity.",
-            "Adapter v2 accepts standalone daily-close, long-only runs with zero "
-            "starting positions and at most one order per symbol/date.",
+            "Adapter v3 accepts standalone prices or validated curated daily "
+            "datasets, long-only runs with zero starting positions, and at "
+            "most one order per symbol/date.",
+            "Adjusted datasets treat declared corporate actions as embedded in "
+            "prices; unadjusted datasets with actions fail closed.",
             (
                 "Independent-policy mode reimplements fixed-weight and momentum "
                 "policy semantics without reading reference signals or trades."

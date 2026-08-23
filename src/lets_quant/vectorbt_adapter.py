@@ -4,6 +4,7 @@ import math
 import platform
 import sys
 from collections import defaultdict
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,14 +19,15 @@ from .cross_engine import (
     write_engine_candidate,
     write_reconciliation_report,
 )
-from .data import load_prices, validate_market_coverage
+from .data import validate_market_coverage
 from .engine_inputs import (
     load_frozen_order_intents,
-    resolve_standalone_prices_path,
+    reject_unsupported_unadjusted_actions,
+    resolve_engine_market_input,
 )
 
 
-ADAPTER_VERSION = "1"
+ADAPTER_VERSION = "2"
 SUPPORTED_VECTORBT_VERSION = "1.1.0"
 
 
@@ -42,6 +44,7 @@ def run_vectorbt_validation(
     reference_directory: Path,
     output_root: Path,
     prices_path: Optional[Path] = None,
+    dataset_path: Optional[Path] = None,
     money_tolerance: float = 1e-6,
     ratio_tolerance: float = 1e-10,
 ) -> Tuple[Path, Dict[str, Any]]:
@@ -68,13 +71,17 @@ def run_vectorbt_validation(
 
     reference_directory = reference_directory.resolve()
     reference_identity(reference_directory)
-    resolved_prices_path, reference_manifest = resolve_standalone_prices_path(
-        reference_directory,
-        prices_path,
-        adapter_name="VectorBT adapter v1",
-    )
     policy = load_policy(reference_directory / "policy.snapshot.json")
-    market = load_prices(resolved_prices_path)
+    market_input = resolve_engine_market_input(
+        reference_directory,
+        supplied_prices_path=prices_path,
+        supplied_dataset_path=dataset_path,
+        adapter_name="VectorBT adapter v2",
+    )
+    reject_unsupported_unadjusted_actions(
+        market_input, adapter_name="VectorBT adapter v2"
+    )
+    market = market_input.market
     symbols = sorted(policy.strategy.target_weights)
     validate_market_coverage(market, symbols)
     reference_nav = read_nav_rows(reference_directory / "nav.csv")
@@ -86,7 +93,7 @@ def run_vectorbt_validation(
         )
     if any(reference_nav[0]["positions"].values()):
         raise EngineValidationError(
-            "VectorBT adapter v1 supports zero starting positions only"
+            "VectorBT adapter v2 supports zero starting positions only"
         )
     market_prices: Dict[str, Dict[str, float]] = {
         trading_date.isoformat(): {
@@ -106,7 +113,7 @@ def run_vectorbt_validation(
         symbols=symbols,
         trading_dates=trading_dates,
         market_prices=market_prices,
-        adapter_name="VectorBT adapter v1",
+        adapter_name="VectorBT adapter v2",
     )
 
     close = pd.DataFrame(
@@ -123,14 +130,21 @@ def run_vectorbt_validation(
     symbol_indexes = {symbol: index for index, symbol in enumerate(symbols)}
     date_indexes = {value: index for index, value in enumerate(trading_dates)}
     intents_by_date: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    tradable_intents = set()
     for intent in intents:
         row_index = date_indexes[intent["execution_date"]]
         column_index = symbol_indexes[intent["symbol"]]
-        sizes[row_index, column_index] = (
-            intent["quantity"]
-            if intent["side"] == "BUY"
-            else -intent["quantity"]
-        )
+        if market.is_tradable(
+            date.fromisoformat(intent["execution_date"]), intent["symbol"]
+        ):
+            tradable_intents.add(
+                (intent["execution_date"], intent["symbol"])
+            )
+            sizes[row_index, column_index] = (
+                intent["quantity"]
+                if intent["side"] == "BUY"
+                else -intent["quantity"]
+            )
         intents_by_date[intent["execution_date"]].append(intent)
 
     call_sequence = np.tile(np.arange(len(symbols)), (len(close), 1))
@@ -247,6 +261,8 @@ def run_vectorbt_validation(
             symbol_indexes[intent["symbol"]],
         )
         for intent in intents
+        if (intent["execution_date"], intent["symbol"])
+        in tradable_intents
     }
     unexpected_cells = sorted(set(records_by_cell) - expected_cells)
     if unexpected_cells:
@@ -259,8 +275,19 @@ def run_vectorbt_validation(
         row_index = date_indexes[intent["execution_date"]]
         column_index = symbol_indexes[intent["symbol"]]
         record = records_by_cell.get((row_index, column_index))
+        is_tradable = (
+            intent["execution_date"], intent["symbol"]
+        ) in tradable_intents
         expected_side = 0 if intent["side"] == "BUY" else 1
-        if record is None:
+        if not is_tradable:
+            if record is not None:
+                raise EngineValidationError(
+                    "VectorBT received an order for a non-tradable observation"
+                )
+            filled_quantity = 0
+            fill_price = float(prices[row_index, column_index])
+            recorded_fees = 0.0
+        elif record is None:
             filled_quantity = 0
             fill_price = prices[row_index, column_index] * (
                 1.0 + slippage
@@ -298,7 +325,9 @@ def run_vectorbt_validation(
                 "VectorBT fee record cannot be decomposed into configured "
                 "commission and sell tax"
             )
-        if filled_quantity == 0:
+        if not is_tradable:
+            status = "rejected_not_tradable"
+        elif filled_quantity == 0:
             status = "rejected"
         elif filled_quantity < intent["quantity"]:
             status = "partial"
@@ -323,6 +352,17 @@ def run_vectorbt_validation(
                 "status": status,
             }
         )
+    intent_sequences = {
+        (intent["execution_date"], intent["symbol"]): intent["sequence"]
+        for intent in intents
+    }
+    trade_rows.sort(
+        key=lambda row: (
+            date_indexes[row["execution_date"]],
+            0 if row["status"] == "rejected_not_tradable" else 1,
+            intent_sequences[(row["execution_date"], row["symbol"])],
+        )
+    )
 
     values = _as_single_series(portfolio.value(group_by=True), "value")
     cash = _as_single_series(portfolio.cash(group_by=True), "cash")
@@ -350,6 +390,28 @@ def run_vectorbt_validation(
         )
 
     metrics = summarize_candidate(nav_rows, trade_rows)
+    market_scope: Dict[str, Any] = {
+        "reference_data_source": market_input.source_type,
+        "prices_sha256": file_sha256(market_input.prices_path),
+        "price_adjustment": market.price_adjustment,
+        "tradability_source": (
+            "curated_observations"
+            if market_input.source_type == "curated_dataset"
+            else "all_observations_tradable"
+        ),
+    }
+    if market_input.dataset_manifest is not None:
+        market_scope.update(
+            {
+                "dataset_id": market_input.dataset_manifest["dataset_id"],
+                "dataset_snapshot_sha256": (
+                    market_input.dataset_snapshot_sha256
+                ),
+                "observations_sha256": market_input.dataset_manifest[
+                    "files"
+                ]["observations.csv"],
+            }
+        )
     candidate_directory = write_engine_candidate(
         reference_directory=reference_directory,
         output_root=output_root,
@@ -386,17 +448,20 @@ def run_vectorbt_validation(
             "excluded_components": [
                 "strategy signal generation and point-in-time feature logic",
                 "market data correctness and provider lineage",
-                "tradability, corporate actions, and adjusted-price semantics",
+                "unadjusted corporate-action accounting",
+                "correctness of adjusted-price factors",
                 "order book, liquidity, price limits, and intraday execution",
             ],
-            "reference_data_source": reference_manifest["data_source"]["type"],
-            "prices_sha256": file_sha256(resolved_prices_path),
+            **market_scope,
         },
         limitations=[
             "Parity validates software behavior for this frozen input only; it "
             "does not establish strategy or investment validity.",
-            "Adapter v1 accepts standalone daily-close, long-only runs with "
-            "zero starting positions and at most one order per symbol/date.",
+            "Adapter v2 accepts standalone prices or validated curated daily "
+            "datasets, long-only runs with zero starting positions, and at "
+            "most one order per symbol/date.",
+            "Curated tradability rejection is adapter logic; VectorBT does not "
+            "natively model suspensions in this integration.",
             "The adapter independently replays order intents but deliberately "
             "does not regenerate strategy decisions.",
             "Dynamic cash-buffer and whole-lot affordable quantities are "

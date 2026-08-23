@@ -18,9 +18,10 @@
 - train/validation/test 时间隔离、成本与成交延迟压力实验。
 - 多个滚动时间折和邻近策略参数敏感性矩阵，不自动选择最优参数。
 - 带严格输入指纹和差异报告的跨引擎候选产物契约与对账器。
-- 可选 VectorBT 1.1.0 适配器，规则 lowering 后复核成交、费用、持仓和 NAV。
+- 可选 VectorBT 1.1.0 适配器，消费独立 CSV 或清洗数据集，复核停牌拒绝、成交、
+  费用、持仓和 NAV。
 - 可选 RQAlpha 6.3.0 事件驱动适配器，独立复算 PIT 策略信号，并原生复核订单、
-  部分成交、撤拒单和账户。
+  清洗 OHLCV、停牌前置拒绝、部分成交、撤拒单和账户。
 - 六类确定性合成市场，用于验证软件语义和失败边界。
 - 显式现金/持仓账本、公司行动入账和每日资产恒等式校验。
 - 可持久化的离线 paper 订单状态机、事件幂等和重启恢复。
@@ -190,6 +191,19 @@ PYTHONPATH=src python -m lets_quant validate-rqalpha \
   --prices examples/prices.csv
 ```
 
+参考回测来自 M1 清洗数据集时，必须保留完整数据语义，不能降级传入裸
+`prices.csv`：
+
+```bash
+PYTHONPATH=src python -m lets_quant validate-vectorbt \
+  --reference-run artifacts/runs/<run-id> \
+  --dataset data/curated/<dataset-id>
+
+PYTHONPATH=src python -m lets_quant validate-rqalpha \
+  --reference-run artifacts/runs/<run-id> \
+  --dataset data/curated/<dataset-id>
+```
+
 候选目录包含带 SHA-256 的 manifest、规范化 NAV、成交、指标和对账报告。
 RQAlpha 候选还包含 `signals.csv`、`orders.csv` 与 `events.csv`；对账器会分别
 验证策略决策与拟议订单、事件顺序、累计成交、费用和最终状态。任何输入漂移、
@@ -198,8 +212,9 @@ RQAlpha 候选还包含 `signals.csv`、`orders.csv` 与 `events.csv`；对账�
 RQAlpha 的成交数量和生命周期由引擎原生生成；现金缓冲的暂存/恢复仍是适配层
 映射。`validate-rqalpha` 默认使用 `independent_policy`；诊断旧执行链路时可显式
 传入 `--decision-mode frozen_orders`，但该模式不会验证策略决策。VectorBT 仍只
-重放冻结订单意图。两个适配器只支持独立 CSV、零初始持仓、只做多日线运行，
-清洗数据集中的停牌和公司行动会 fail closed。
+重放冻结订单意图。两个适配器支持绑定哈希的独立 CSV 和质量通过的清洗日线
+数据集，并复核停牌拒绝；仍只支持零初始持仓和只做多。复权数据中的公司行动
+按“已嵌入价格”处理，未复权且包含公司行动的跨引擎运行会 fail closed。
 完整契约与扩展方法见
 [跨引擎验证](docs/CROSS_ENGINE_VALIDATION.md)。
 

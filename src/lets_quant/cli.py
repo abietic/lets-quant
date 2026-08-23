@@ -223,10 +223,16 @@ def build_parser() -> argparse.ArgumentParser:
     vectorbt_validation.add_argument(
         "--reference-run", type=Path, required=True
     )
-    vectorbt_validation.add_argument(
+    vectorbt_source = vectorbt_validation.add_mutually_exclusive_group()
+    vectorbt_source.add_argument(
         "--prices",
         type=Path,
         help="price CSV; defaults to the path bound by the reference manifest",
+    )
+    vectorbt_source.add_argument(
+        "--dataset",
+        type=Path,
+        help="curated dataset; defaults to the path bound by the reference",
     )
     vectorbt_validation.add_argument(
         "--output-root",
@@ -250,10 +256,16 @@ def build_parser() -> argparse.ArgumentParser:
     rqalpha_validation.add_argument(
         "--reference-run", type=Path, required=True
     )
-    rqalpha_validation.add_argument(
+    rqalpha_source = rqalpha_validation.add_mutually_exclusive_group()
+    rqalpha_source.add_argument(
         "--prices",
         type=Path,
         help="price CSV; defaults to the path bound by the reference manifest",
+    )
+    rqalpha_source.add_argument(
+        "--dataset",
+        type=Path,
+        help="curated dataset; defaults to the path bound by the reference",
     )
     rqalpha_validation.add_argument(
         "--liquidity",
@@ -702,6 +714,7 @@ def _validate_vectorbt(args: argparse.Namespace) -> int:
     destination, report = run_vectorbt_validation(
         reference_directory=args.reference_run,
         prices_path=args.prices,
+        dataset_path=args.dataset,
         output_root=args.output_root,
         money_tolerance=args.money_tolerance,
         ratio_tolerance=args.ratio_tolerance,
@@ -730,6 +743,7 @@ def _validate_rqalpha(args: argparse.Namespace) -> int:
     destination, report = run_rqalpha_validation(
         reference_directory=args.reference_run,
         prices_path=args.prices,
+        dataset_path=args.dataset,
         liquidity_path=args.liquidity,
         decision_mode=args.decision_mode,
         volume_percent=args.volume_percent,

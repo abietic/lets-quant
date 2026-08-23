@@ -119,7 +119,11 @@ class CrossEngineTest(unittest.TestCase):
         )
 
     def _lifecycle_candidate_run(
-        self, temporary: Path, reference: Path
+        self,
+        temporary: Path,
+        reference: Path,
+        *,
+        precheck_reject_first: bool = False,
     ) -> Path:
         nav_rows = read_nav_rows(reference / "nav.csv")
         trade_rows = read_trade_rows(reference / "trades.csv")
@@ -128,21 +132,61 @@ class CrossEngineTest(unittest.TestCase):
         sequence = 1
         for index, trade in enumerate(trade_rows, start=1):
             order_id = f"fixture-order-{index}"
-            full = trade["filled_quantity"] == trade["requested_quantity"]
-            final_status = "FILLED" if full else "CANCELLED"
-            events = [
-                ("order_pending_new", "PENDING_NEW", 0, 0.0, 0.0, 0.0),
-                ("order_creation_pass", "ACTIVE", 0, 0.0, 0.0, 0.0),
-                (
-                    "trade",
-                    "FILLED" if full else "ACTIVE",
-                    trade["filled_quantity"],
-                    trade["fill_price"],
-                    trade["commission"],
-                    trade["tax"],
-                ),
-            ]
-            if not full:
+            precheck_rejected = precheck_reject_first and index == 1
+            if precheck_rejected:
+                trade.update(
+                    {
+                        "filled_quantity": 0,
+                        "notional": 0.0,
+                        "commission": 0.0,
+                        "tax": 0.0,
+                        "slippage": 0.0,
+                        "status": "rejected_not_tradable",
+                    }
+                )
+                final_status = "REJECTED"
+                events = [
+                    (
+                        "order_tradability_reject",
+                        "REJECTED",
+                        0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    )
+                ]
+            else:
+                full = (
+                    trade["filled_quantity"] == trade["requested_quantity"]
+                )
+                final_status = "FILLED" if full else "CANCELLED"
+                events = [
+                    (
+                        "order_pending_new",
+                        "PENDING_NEW",
+                        0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ),
+                    (
+                        "order_creation_pass",
+                        "ACTIVE",
+                        0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ),
+                    (
+                        "trade",
+                        "FILLED" if full else "ACTIVE",
+                        trade["filled_quantity"],
+                        trade["fill_price"],
+                        trade["commission"],
+                        trade["tax"],
+                    ),
+                ]
+            if not precheck_rejected and not full:
                 events.append(
                     (
                         "order_unsolicited_update",
@@ -191,12 +235,14 @@ class CrossEngineTest(unittest.TestCase):
                     "side": trade["side"],
                     "requested_quantity": trade["requested_quantity"],
                     "filled_quantity": trade["filled_quantity"],
-                    "avg_fill_price": trade["fill_price"],
+                    "avg_fill_price": (
+                        0.0 if precheck_rejected else trade["fill_price"]
+                    ),
                     "commission": trade["commission"],
                     "tax": trade["tax"],
                     "final_status": final_status,
                     "event_count": len(events),
-                    "trade_count": 1,
+                    "trade_count": 0 if precheck_rejected else 1,
                 }
             )
         return write_engine_candidate(
@@ -452,6 +498,42 @@ class CrossEngineTest(unittest.TestCase):
             self.assertEqual(
                 report["summary"]["order_lifecycle"]["partial_order_count"],
                 1,
+            )
+
+    def test_precheck_tradability_rejection_is_a_single_final_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            reference = self._reference_run(temporary)
+            candidate = self._lifecycle_candidate_run(
+                temporary,
+                reference,
+                precheck_reject_first=True,
+            )
+
+            report = reconcile_engine_candidate(reference, candidate)
+
+            checks = {check["name"]: check for check in report["checks"]}
+            self.assertEqual(checks["order_lifecycle"]["status"], "pass")
+            self.assertEqual(
+                report["summary"]["order_lifecycle"]["rejected_order_count"],
+                1,
+            )
+
+            events_path = candidate / "events.csv"
+            events_path.write_text(
+                events_path.read_text(encoding="utf-8").replace(
+                    "order_tradability_reject", "order_pending_new", 1
+                ),
+                encoding="utf-8",
+            )
+            self._refresh_candidate_identity(candidate, "events.csv")
+
+            tampered = reconcile_engine_candidate(reference, candidate)
+            tampered_checks = {
+                check["name"]: check for check in tampered["checks"]
+            }
+            self.assertEqual(
+                tampered_checks["order_lifecycle"]["status"], "blocked"
             )
 
     def test_hash_consistent_lifecycle_drift_is_blocked(self) -> None:

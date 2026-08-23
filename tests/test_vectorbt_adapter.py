@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import importlib.util
 import io
 import json
@@ -7,6 +8,8 @@ import unittest
 from pathlib import Path
 
 from lets_quant.cli import main
+
+from tests.engine_helpers import build_curated_reference
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,6 +111,49 @@ class VectorbtAdapterTest(unittest.TestCase):
 
             self.assertEqual(payload["status"], "pass")
             self.assertEqual(payload["summary"]["candidate_nav_rows"], 4)
+
+    def test_curated_suspension_is_rejected_without_losing_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            fixture = build_curated_reference(
+                temporary,
+                suspended_symbol="511010.XSHG",
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "validate-vectorbt",
+                        "--reference-run",
+                        str(fixture["reference"]),
+                        "--output-root",
+                        str(temporary / "candidate"),
+                    ]
+                )
+            payload = json.loads(stdout.getvalue())
+
+            self.assertEqual(exit_code, 0, payload)
+            self.assertEqual(payload["status"], "pass")
+            candidate = Path(payload["candidate_directory"])
+            with (candidate / "trades.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                trades = list(csv.DictReader(handle))
+            rejected = [
+                trade
+                for trade in trades
+                if trade["status"] == "rejected_not_tradable"
+            ]
+            self.assertEqual(len(rejected), 1)
+            self.assertEqual(rejected[0]["symbol"], "511010.XSHG")
+            manifest = json.loads(
+                (candidate / "manifest.json").read_text(encoding="utf-8")
+            )
+            scope = manifest["validation_scope"]
+            self.assertEqual(scope["reference_data_source"], "curated_dataset")
+            self.assertEqual(
+                scope["tradability_source"], "curated_observations"
+            )
 
 
 if __name__ == "__main__":

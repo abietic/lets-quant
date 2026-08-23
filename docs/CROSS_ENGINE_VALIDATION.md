@@ -9,8 +9,8 @@
 
 | 引擎 | 主要独立证据 | 仍由适配层映射 |
 |---|---|---|
-| VectorBT 1.1.0 | 订单记录、共享现金、持仓和组合价值 | 卖出顺序、现金缓冲、可买整手数量和费用拆分 |
-| RQAlpha 6.3.0 | 独立固定权重/动量 PIT 决策，事件循环、撮合、撤拒单、费用、账户和 NAV | 目标整手与换手率规则、合成证券代码、动态现金缓冲、平坦 OHLC |
+| VectorBT 1.1.0 | 订单记录、共享现金、持仓和组合价值 | 停牌拒绝、卖出顺序、现金缓冲、整手数量和费用拆分 |
+| RQAlpha 6.3.0 | 独立固定权重/动量 PIT 决策，清洗 OHLCV、原生停牌前置拒绝、撮合、费用、账户和 NAV | 目标整手与换手率规则、合成证券代码、动态现金缓冲 |
 
 两条链路都只验证 manifest 明确声明的范围。RQAlpha 的独立实现可以发现固定
 权重和动量策略的 PIT 决策、目标整手及风险门禁漂移，但不能证明市场数据正确、
@@ -65,6 +65,20 @@ PYTHONPATH=src python -m lets_quant validate-rqalpha \
   --prices examples/prices.csv
 ```
 
+参考运行使用 `curated_dataset` 时，适配器会从参考 manifest 推断原目录；数据集
+移动后也可显式传入 `--dataset`。此时禁止传入 `--prices`，因为裸收盘价会丢失
+OHLCV、停牌、复权口径和数据 lineage：
+
+```bash
+PYTHONPATH=src python -m lets_quant validate-rqalpha \
+  --reference-run artifacts/runs/<run-id> \
+  --dataset data/curated/<dataset-id>
+```
+
+适配器会重新验证数据集自身全部受保护文件、参考中的 `dataset.snapshot.json`、
+dataset ID、as-of、源快照 ID、质量状态和价格哈希。另一个同样合法但身份不同的
+数据集也不能替换参考输入。
+
 RQAlpha 默认使用 `--decision-mode independent_policy`。仅需隔离诊断执行链路时，
 可以改用：
 
@@ -85,9 +99,9 @@ make vectorbt-test vectorbt-demo
 make rqalpha-test rqalpha-demo
 ```
 
-价格文件 SHA-256 必须与参考 manifest 一致。参考 manifest 还必须包含 v0.7.0
-引入的 `file_sha256` 映射。v0.9.0 的候选和报告 schema 已升级为 v3；旧候选必须
-重新生成，不能降级绕过。
+价格或数据集 SHA-256 必须与参考 manifest 一致。参考 manifest 还必须包含
+v0.7.0 引入的 `file_sha256` 映射。v0.10.0 的候选和报告 schema 已升级为 v4；
+旧候选必须重新生成，不能降级绕过。
 
 ## RQAlpha 流动性压力
 
@@ -110,7 +124,7 @@ PYTHONPATH=src python -m lets_quant validate-rqalpha \
 
 ## 候选契约
 
-候选 schema v3 的基础产物为：
+候选 schema v4 的基础产物为：
 
 - `manifest.json`：引擎版本、参考指纹、候选哈希、验证范围和限制。
 - `nav.csv`：逐日 NAV、现金和持仓。
@@ -121,7 +135,9 @@ PYTHONPATH=src python -m lets_quant validate-rqalpha \
 事件驱动引擎还必须写入：
 
 - `orders.csv`：每个原生订单的请求量、成交量、均价、费用和最终状态。
-- `events.csv`：带全局顺序和时区的受理、活动、成交、撤单或拒单事件。
+- `events.csv`：带全局顺序和时区的受理、活动、成交、撤单或拒单事件；引擎在
+  创建订单对象前拒绝时，使用单事件的 `order_precheck_reject`，明确由停牌触发
+  时使用 `order_tradability_reject`。
 
 声明 `validation_scope.input=independent_policy` 的候选还必须写入：
 
@@ -135,7 +151,8 @@ ID 格式和订单结构。`accepted` 必须包含订单，`no_action` 不能包
 两份生命周期文件必须同时存在并纳入 candidate ID。对账器验证：
 
 - 事件序号连续、时间不倒退，事件不能引用未知订单，成交 ID 不能复用。
-- 每个订单从 `PENDING_NEW` 开始，经过受理后才能成交。
+- 已创建订单从 `PENDING_NEW` 开始，经过受理后才能成交；引擎前置拒绝必须是
+  单个终态事件，不能伪造订单受理过程。
 - 累计成交等于逐事件成交之和，且不超过请求量。
 - 非成交事件不能携带成交量、成交价或费用；满额成交、撤单和拒单状态必须与
   实际成交量一致。
@@ -170,12 +187,15 @@ PYTHONPATH=src python -m lets_quant reconcile-engine \
 
 ## 当前限制
 
-VectorBT adapter v1 与 RQAlpha adapter v2 都只接受 `standalone_prices_csv`、
-日线、只做多、零初始持仓，且同标的同执行日最多一笔订单。它们会拒绝清洗
-数据集中的停牌、公司行动和复权语义，因为这些能力尚未独立映射。
+VectorBT adapter v2 与 RQAlpha adapter v3 接受 `standalone_prices_csv` 或质量
+通过且身份与参考快照一致的 `curated_dataset`，仍限日线、只做多、零初始持仓，
+且同标的同执行日最多一笔订单。VectorBT 的停牌拒绝属于显式 adapter lowering；
+RQAlpha 使用清洗 OHLCV、实际成交量和原生交易状态检查。两者都将 `qfq/hfq`
+公司行动视为已嵌入价格；`adjustment=none` 且存在公司行动时直接拒绝，因为独立
+现金分红和拆并股会计尚未实现。
 
 RQAlpha 默认通过独立模块复算当前支持的固定权重和动量策略，不导入参考
 `strategies.py`、`risk.py` 或 `backtest.py`；旧的 `frozen_orders` 模式只用于执行
 诊断。目标整手、换手率和现金缓冲仍是适配层规则，VectorBT 的可买数量也仍是
-adapter lowering。下一阶段需要把停牌、公司行动、非零初始持仓、容量与真实且
-有使用权的数据纳入复核。
+adapter lowering。下一阶段需要独立实现未复权公司行动、非零初始持仓和证券
+主数据映射，并用真实且有使用权的数据做容量复核。

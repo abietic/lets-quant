@@ -34,5 +34,5 @@ jobs:
           python -m pip install -e '.[dev,rqalpha]'
       - name: Run core checks
         run: make lint check
-      - name: Run independent-policy and RQAlpha lifecycle acceptance
+      - name: Run policy, curated-data, and RQAlpha lifecycle acceptance
         run: make rqalpha-test rqalpha-demo
