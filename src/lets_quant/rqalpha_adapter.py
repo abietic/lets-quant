@@ -8,7 +8,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .config import load_policy
 from .cross_engine import (
@@ -24,13 +24,20 @@ from .cross_engine import (
 from .data import load_prices, validate_market_coverage
 from .engine_inputs import (
     load_frozen_order_intents,
+    load_json_object,
     resolve_standalone_prices_path,
 )
+from .independent_policy import (
+    IndependentPolicyError,
+    independent_signal,
+)
+from .models import Policy
 
 
-ADAPTER_VERSION = "1"
+ADAPTER_VERSION = "2"
 SUPPORTED_RQALPHA_VERSION = "6.3.0"
 CHINA_TIMEZONE = timezone(timedelta(hours=8))
+DECISION_MODES = {"independent_policy", "frozen_orders"}
 
 __config__ = {"priority": 200}
 
@@ -46,9 +53,16 @@ class _RuntimeContext:
     lot_size: int
     cash_buffer_weight: float
     slippage_fraction: float
+    policy: Policy
+    decision_mode: str
+    execution_delay_trading_days: int
     intents: List[Dict[str, Any]]
+    pending_intents: List[Dict[str, Any]]
+    signals: List[Dict[str, Any]] = field(default_factory=list)
     events: List[Dict[str, Any]] = field(default_factory=list)
     nav_rows: List[Dict[str, Any]] = field(default_factory=list)
+    peak_nav: float = 0.0
+    risk_frozen: bool = False
 
 
 _RUNTIMES: Dict[str, _RuntimeContext] = {}
@@ -489,34 +503,182 @@ def _strategy_init(context: Any) -> None:
     subscribe([runtime.mapped_symbols[symbol] for symbol in runtime.symbols])
 
 
-def _strategy_handle_bar(context: Any, bar_dict: Any) -> None:
-    del bar_dict
+def _portfolio_positions(
+    portfolio: Any, runtime: _RuntimeContext
+) -> Dict[str, int]:
+    positions = {symbol: 0 for symbol in runtime.symbols}
+    for position in portfolio.get_positions():
+        quantity = int(position.quantity)
+        if quantity == 0:
+            continue
+        mapped = str(position.order_book_id)
+        symbol = runtime.original_symbols.get(mapped)
+        if symbol is None:
+            raise IndependentPolicyError(
+                f"unexpected RQAlpha position {mapped}"
+            )
+        if quantity < 0:
+            raise IndependentPolicyError(
+                "short positions are outside adapter scope"
+            )
+        positions[symbol] += quantity
+    return positions
+
+
+def _current_bar_prices(
+    bar_dict: Any, runtime: _RuntimeContext
+) -> Dict[str, float]:
+    prices: Dict[str, float] = {}
+    for symbol in runtime.symbols:
+        mapped = runtime.mapped_symbols[symbol]
+        price = float(bar_dict[mapped].close)
+        if not math.isfinite(price) or price <= 0:
+            raise IndependentPolicyError(
+                f"RQAlpha current bar is invalid for {symbol}"
+            )
+        prices[symbol] = price
+    return prices
+
+
+def _visible_history(
+    runtime: _RuntimeContext,
+    *,
+    trading_date: str,
+    current_prices: Mapping[str, float],
+) -> Dict[str, List[Tuple[str, float]]]:
+    from rqalpha.api import history_bars
+
+    history = {
+        symbol: [(trading_date, current_prices[symbol])]
+        for symbol in runtime.symbols
+    }
+    lookback = runtime.policy.strategy.lookback_trading_days
+    if runtime.policy.strategy.kind != "momentum_filter" or lookback is None:
+        return history
+    for symbol in runtime.symbols:
+        mapped = runtime.mapped_symbols[symbol]
+        raw_bars = history_bars(
+            mapped,
+            lookback + 1,
+            "1d",
+            ["datetime", "close"],
+            skip_suspended=False,
+        )
+        observations: List[Tuple[str, float]] = []
+        for raw_bar in raw_bars:
+            raw_datetime = str(int(raw_bar["datetime"])).zfill(14)
+            observed_date = datetime.strptime(
+                raw_datetime[:8], "%Y%m%d"
+            ).date().isoformat()
+            observations.append((observed_date, float(raw_bar["close"])))
+        if observations and observations[-1][0] == trading_date:
+            observations[-1] = (trading_date, current_prices[symbol])
+        else:
+            observations.append((trading_date, current_prices[symbol]))
+        history[symbol] = observations
+    return history
+
+
+def _submit_intent(
+    context: Any,
+    runtime: _RuntimeContext,
+    intent: Mapping[str, Any],
+) -> None:
     from rqalpha.api import deposit, order_shares, withdraw
 
+    mapped = runtime.mapped_symbols[str(intent["symbol"])]
+    amount = int(intent["quantity"])
+    if intent["side"] == "SELL":
+        order_shares(mapped, -amount)
+        return
+    reserve = max(
+        0.0,
+        float(context.portfolio.total_value)
+        * runtime.cash_buffer_weight,
+    )
+    reserved_cash = min(reserve, max(0.0, float(context.portfolio.cash)))
+    if reserved_cash > 0:
+        withdraw("STOCK", reserved_cash)
+    try:
+        order_shares(mapped, amount)
+    finally:
+        if reserved_cash > 0:
+            deposit("STOCK", reserved_cash)
+
+
+def _strategy_handle_bar(context: Any, bar_dict: Any) -> None:
     runtime = _RUNTIMES[context.lets_quant_runtime_id]
     trading_date = context.now.date().isoformat()
-    for intent in runtime.intents:
-        if intent["execution_date"] != trading_date:
-            continue
-        mapped = runtime.mapped_symbols[intent["symbol"]]
-        amount = int(intent["quantity"])
-        if intent["side"] == "SELL":
-            amount *= -1
-            order_shares(mapped, amount)
-            continue
-        reserve = max(
-            0.0,
-            float(context.portfolio.total_value)
-            * runtime.cash_buffer_weight,
+    due_intents = [
+        intent
+        for intent in runtime.pending_intents
+        if intent["execution_date"] == trading_date
+    ]
+    runtime.pending_intents = [
+        intent
+        for intent in runtime.pending_intents
+        if intent["execution_date"] != trading_date
+    ]
+    for intent in sorted(
+        due_intents,
+        key=lambda item: (0 if item["side"] == "SELL" else 1, item["sequence"]),
+    ):
+        _submit_intent(context, runtime, intent)
+
+    if runtime.decision_mode == "frozen_orders":
+        return
+    current_prices = _current_bar_prices(bar_dict, runtime)
+    positions = _portfolio_positions(context.portfolio, runtime)
+    nav = float(context.portfolio.cash) + sum(
+        positions[symbol] * current_prices[symbol]
+        for symbol in runtime.symbols
+    )
+    runtime.peak_nav = max(runtime.peak_nav, nav)
+    drawdown = nav / runtime.peak_nav - 1 if runtime.peak_nav > 0 else -1.0
+    if drawdown <= -runtime.policy.risk.max_drawdown:
+        runtime.risk_frozen = True
+
+    current_index = runtime.trading_dates.index(trading_date)
+    execution_index = current_index + runtime.execution_delay_trading_days
+    if (
+        current_index
+        % runtime.policy.strategy.rebalance_every_n_trading_days
+        != 0
+        or execution_index >= len(runtime.trading_dates)
+    ):
+        return
+    if runtime.risk_frozen or runtime.pending_intents:
+        history = {
+            symbol: [(trading_date, current_prices[symbol])]
+            for symbol in runtime.symbols
+        }
+    else:
+        history = _visible_history(
+            runtime,
+            trading_date=trading_date,
+            current_prices=current_prices,
         )
-        reserved_cash = min(reserve, max(0.0, float(context.portfolio.cash)))
-        if reserved_cash > 0:
-            withdraw("STOCK", reserved_cash)
-        try:
-            order_shares(mapped, amount)
-        finally:
-            if reserved_cash > 0:
-                deposit("STOCK", reserved_cash)
+    signal = independent_signal(
+        runtime.policy,
+        signal_date=trading_date,
+        execution_date=runtime.trading_dates[execution_index],
+        nav=nav,
+        positions=positions,
+        current_prices=current_prices,
+        history_by_symbol=history,
+        risk_frozen=runtime.risk_frozen,
+        pending_order_count=len(runtime.pending_intents),
+    )
+    runtime.signals.append(signal)
+    if signal["status"] != "accepted":
+        return
+    for order in signal["orders"]:
+        intent = {
+            "sequence": len(runtime.intents),
+            **dict(order),
+        }
+        runtime.intents.append(intent)
+        runtime.pending_intents.append(intent)
 
 
 def _normalize_engine_results(
@@ -550,7 +712,7 @@ def _normalize_engine_results(
         intent = intents_by_key.get(key)
         if intent is None or key in consumed_keys:
             raise EngineValidationError(
-                f"RQAlpha order {order_id} cannot be bound to one frozen intent"
+                f"RQAlpha order {order_id} cannot be bound to one candidate intent"
             )
         consumed_keys.add(key)
         trade_events = [event for event in events if event["event_type"] == "trade"]
@@ -565,7 +727,8 @@ def _normalize_engine_results(
         commission = sum(event["commission"] for event in trade_events)
         tax = sum(event["tax"] for event in trade_events)
         final_status = events[-1]["order_status"]
-        order_rows_by_sequence[int(intent["sequence"])] = {
+        event_sequence = int(first["sequence"])
+        order_rows_by_sequence[event_sequence] = {
             "order_id": order_id,
             "signal_date": intent["signal_date"],
             "execution_date": intent["execution_date"],
@@ -601,7 +764,7 @@ def _normalize_engine_results(
             if filled_quantity > 0
             else "rejected"
         )
-        trade_rows_by_sequence[int(intent["sequence"])] = {
+        trade_rows_by_sequence[event_sequence] = {
             "signal_date": intent["signal_date"],
             "execution_date": intent["execution_date"],
             "symbol": intent["symbol"],
@@ -620,7 +783,7 @@ def _normalize_engine_results(
     if consumed_keys != set(intents_by_key):
         missing = sorted(set(intents_by_key) - consumed_keys)
         raise EngineValidationError(
-            f"RQAlpha did not emit orders for frozen intents: {missing[:5]}"
+            f"RQAlpha did not emit orders for candidate intents: {missing[:5]}"
         )
     sequence_order = sorted(order_rows_by_sequence)
     return (
@@ -635,6 +798,7 @@ def run_rqalpha_validation(
     output_root: Path,
     prices_path: Optional[Path] = None,
     liquidity_path: Optional[Path] = None,
+    decision_mode: str = "independent_policy",
     volume_percent: float = 1.0,
     money_tolerance: float = 1e-6,
     ratio_tolerance: float = 1e-10,
@@ -645,6 +809,10 @@ def run_rqalpha_validation(
         )
     if not math.isfinite(volume_percent) or not 0 < volume_percent <= 1:
         raise EngineValidationError("volume_percent must be finite in (0, 1]")
+    if decision_mode not in DECISION_MODES:
+        raise EngineValidationError(
+            "decision_mode must be independent_policy or frozen_orders"
+        )
     try:
         import numpy as np
         import pandas as pd
@@ -668,9 +836,22 @@ def run_rqalpha_validation(
     resolved_prices_path, reference_manifest = resolve_standalone_prices_path(
         reference_directory,
         prices_path,
-        adapter_name="RQAlpha adapter v1",
+        adapter_name="RQAlpha adapter v2",
     )
     policy = load_policy(reference_directory / "policy.snapshot.json")
+    reference_metrics = load_json_object(
+        reference_directory / "metrics.json"
+    )
+    execution_delay = reference_metrics.get("execution_delay_trading_days")
+    if (
+        isinstance(execution_delay, bool)
+        or not isinstance(execution_delay, int)
+        or execution_delay <= 0
+    ):
+        raise EngineValidationError(
+            "reference metrics must declare a positive integer "
+            "execution_delay_trading_days"
+        )
     market = load_prices(resolved_prices_path)
     symbols = sorted(policy.strategy.target_weights)
     validate_market_coverage(market, symbols)
@@ -682,7 +863,7 @@ def run_rqalpha_validation(
         )
     if any(reference_nav[0]["positions"].values()):
         raise EngineValidationError(
-            "RQAlpha adapter v1 supports zero starting positions only"
+            "RQAlpha adapter v2 supports zero starting positions only"
         )
     market_prices = {
         trading_date.isoformat(): {
@@ -696,14 +877,17 @@ def run_rqalpha_validation(
             "price input is missing reference NAV dates: "
             + ", ".join(missing_dates[:5])
         )
-    intents = load_frozen_order_intents(
-        reference_directory / "signals.csv",
-        lot_size=policy.execution.lot_size,
-        symbols=symbols,
-        trading_dates=trading_dates,
-        market_prices=market_prices,
-        adapter_name="RQAlpha adapter v1",
-    )
+    if decision_mode == "frozen_orders":
+        intents = load_frozen_order_intents(
+            reference_directory / "signals.csv",
+            lot_size=policy.execution.lot_size,
+            symbols=symbols,
+            trading_dates=trading_dates,
+            market_prices=market_prices,
+            adapter_name="RQAlpha adapter v2 frozen-orders mode",
+        )
+    else:
+        intents = []
     volumes, liquidity_sha256 = _load_liquidity(
         liquidity_path,
         trading_dates=trading_dates,
@@ -722,7 +906,12 @@ def run_rqalpha_validation(
         lot_size=policy.execution.lot_size,
         cash_buffer_weight=policy.portfolio.cash_buffer_weight,
         slippage_fraction=policy.execution.slippage_bps / 10_000,
+        policy=policy,
+        decision_mode=decision_mode,
+        execution_delay_trading_days=execution_delay,
         intents=intents,
+        pending_intents=list(intents),
+        peak_nav=policy.portfolio.initial_cash,
     )
     runtime_id = uuid.uuid4().hex
     _RUNTIMES[runtime_id] = runtime
@@ -823,16 +1012,30 @@ def run_rqalpha_validation(
         metrics=metrics,
         order_rows=order_rows,
         event_rows=runtime.events,
+        signal_rows=(
+            runtime.signals
+            if decision_mode == "independent_policy"
+            else None
+        ),
         validation_scope={
-            "input": "frozen_order_intents",
+            "input": decision_mode,
             "validated_components": [
                 "adapter output contract and reference-input binding",
+                *(
+                    [
+                        "independently generated PIT policy decisions, target "
+                        "weights, turnover, and order intents"
+                    ]
+                    if decision_mode == "independent_policy"
+                    else ["frozen order-intent replay"]
+                ),
                 "RQAlpha native order, trade, cancellation, and rejection events",
                 "event-to-order-to-normalized-trade lifecycle reconciliation",
                 "daily cash, positions, NAV, costs, and core summary metrics",
             ],
             "engine_native_components": [
                 "daily event loop and current-bar matching",
+                "prior-bar history access and current-bar visibility",
                 "whole-lot and liquidity-constrained order matching",
                 "insufficient-cash partial fills and unfilled market-order "
                 "cancellation",
@@ -840,12 +1043,12 @@ def run_rqalpha_validation(
             ],
             "adapter_mapped_components": [
                 "synthetic RQAlpha instrument identifiers",
-                "sell-before-buy frozen intent submission",
+                "policy strategy semantics, target-lot sizing, turnover gate, "
+                "and sell-before-buy submission",
                 "dynamic cash-buffer withdrawal and immediate redeposit",
                 "standalone close prices mapped to flat OHLC daily bars",
             ],
             "excluded_components": [
-                "strategy signal generation and point-in-time feature logic",
                 "market data correctness and provider lineage",
                 "curated tradability, corporate actions, and adjusted-price semantics",
                 "real order books, queue priority, and intraday execution",
@@ -854,14 +1057,21 @@ def run_rqalpha_validation(
             "prices_sha256": file_sha256(resolved_prices_path),
             "liquidity_sha256": liquidity_sha256,
             "volume_percent": volume_percent,
+            "decision_mode": decision_mode,
+            "execution_delay_trading_days": execution_delay,
         },
         limitations=[
             "Parity validates software behavior for this frozen input only; it "
             "does not establish strategy or investment validity.",
-            "Adapter v1 accepts standalone daily-close, long-only runs with zero "
+            "Adapter v2 accepts standalone daily-close, long-only runs with zero "
             "starting positions and at most one order per symbol/date.",
-            "The adapter independently executes frozen order intents but does not "
-            "regenerate strategy decisions.",
+            (
+                "Independent-policy mode reimplements fixed-weight and momentum "
+                "policy semantics without reading reference signals or trades."
+                if decision_mode == "independent_policy"
+                else "Frozen-orders mode is execution-only diagnostics and does "
+                "not independently validate strategy decisions."
+            ),
             "Cash-buffer reserve mapping is adapter logic; fill quantities, native "
             "order states, transaction costs, and account changes are produced "
             "by RQAlpha.",

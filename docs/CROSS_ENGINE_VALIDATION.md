@@ -1,18 +1,21 @@
 # 跨引擎验证
 
-跨引擎验证用于发现参考回测器自己的成交、费用和会计错误。适配器读取冻结的
-`signals.csv` 订单意图和原始价格，但不能读取参考 `trades.csv` 来决定成交。
-候选生成后，标准库对账器才读取两边结果并逐项比较。
+跨引擎验证用于发现参考回测器自己的策略、成交、费用和会计错误。VectorBT
+读取冻结的 `signals.csv` 订单意图；RQAlpha 默认从策略快照和 point-in-time
+价格历史独立生成信号。两个适配器都不能读取参考 `trades.csv` 来决定候选结果，
+候选生成后，标准库对账器才读取两边产物并逐项比较。
 
 当前有两条互补链路：
 
 | 引擎 | 主要独立证据 | 仍由适配层映射 |
 |---|---|---|
 | VectorBT 1.1.0 | 订单记录、共享现金、持仓和组合价值 | 卖出顺序、现金缓冲、可买整手数量和费用拆分 |
-| RQAlpha 6.3.0 | 事件循环、撮合、资金不足部分成交、撤拒单、费用、账户和 NAV | 合成证券代码、冻结订单提交顺序、动态现金缓冲、平坦 OHLC |
+| RQAlpha 6.3.0 | 独立固定权重/动量 PIT 决策，事件循环、撮合、撤拒单、费用、账户和 NAV | 目标整手与换手率规则、合成证券代码、动态现金缓冲、平坦 OHLC |
 
-两条链路都只验证 manifest 明确声明的范围。它们不重新生成策略信号，不能证明
-PIT 特征、目标权重、市场数据或策略收益有效，更不能授权真实下单。
+两条链路都只验证 manifest 明确声明的范围。RQAlpha 的独立实现可以发现固定
+权重和动量策略的 PIT 决策、目标整手及风险门禁漂移，但不能证明市场数据正确、
+策略收益有效或适用于未来，更不能授权真实下单。VectorBT 仍是执行和组合会计
+验证器，不独立验证策略。
 
 ## 环境
 
@@ -62,6 +65,19 @@ PYTHONPATH=src python -m lets_quant validate-rqalpha \
   --prices examples/prices.csv
 ```
 
+RQAlpha 默认使用 `--decision-mode independent_policy`。仅需隔离诊断执行链路时，
+可以改用：
+
+```bash
+PYTHONPATH=src python -m lets_quant validate-rqalpha \
+  --reference-run artifacts/runs/<run-id> \
+  --prices examples/prices.csv \
+  --decision-mode frozen_orders
+```
+
+`frozen_orders` 不写候选 `signals.csv`，也不会产生 `policy_decisions` 检查，不能
+用它声称策略已被第二实现复核。
+
 也可以使用验收入口：
 
 ```bash
@@ -70,7 +86,8 @@ make rqalpha-test rqalpha-demo
 ```
 
 价格文件 SHA-256 必须与参考 manifest 一致。参考 manifest 还必须包含 v0.7.0
-引入的 `file_sha256` 映射；旧运行必须用当前版本重新生成，不能降级绕过。
+引入的 `file_sha256` 映射。v0.9.0 的候选和报告 schema 已升级为 v3；旧候选必须
+重新生成，不能降级绕过。
 
 ## RQAlpha 流动性压力
 
@@ -86,12 +103,14 @@ PYTHONPATH=src python -m lets_quant validate-rqalpha \
 
 文件必须覆盖参考日期与策略标的的完整笛卡尔积，且哈希会写入验证范围。流动性
 压力改变成交时，跨引擎结果应为 `blocked`；但 `order_lifecycle` 仍必须通过，证明
-候选内部的请求量、累计成交、撤余量、费用和最终状态自洽。它是失败阶段诊断，
+候选内部的请求量、累计成交、撤余量、费用和最终状态自洽。由于部分成交会让
+候选持仓与参考持仓分叉，后续目标整手和换手率也可能合理分叉，
+`policy_decisions` 会同时阻断；首个受压前信号仍应完全一致。它是失败阶段诊断，
 不是放宽对账标准。
 
 ## 候选契约
 
-候选 schema v2 的基础产物为：
+候选 schema v3 的基础产物为：
 
 - `manifest.json`：引擎版本、参考指纹、候选哈希、验证范围和限制。
 - `nav.csv`：逐日 NAV、现金和持仓。
@@ -103,6 +122,15 @@ PYTHONPATH=src python -m lets_quant validate-rqalpha \
 
 - `orders.csv`：每个原生订单的请求量、成交量、均价、费用和最终状态。
 - `events.csv`：带全局顺序和时区的受理、活动、成交、撤单或拒单事件。
+
+声明 `validation_scope.input=independent_policy` 的候选还必须写入：
+
+- `signals.csv`：信号日期、执行日期、状态、稳定 decision ID、策略类型、目标
+  权重、PIT 证据、诊断、换手率和拟议订单。
+
+对账器逐信号核对上述字段，并验证日期、JSON 类型、有限数值、SHA-256 decision
+ID 格式和订单结构。`accepted` 必须包含订单，`no_action` 不能包含订单；因换手率
+超限而 `blocked` 的信号可以保留拟议订单作为审计证据，但适配器不会提交它们。
 
 两份生命周期文件必须同时存在并纳入 candidate ID。对账器验证：
 
@@ -125,6 +153,7 @@ PYTHONPATH=src python -m lets_quant validate-rqalpha \
 | 成交价 | 绝对误差不超过 `1e-8` |
 | NAV、现金、费用和成交额 | 绝对误差不超过 `1e-6` |
 | 收益、回撤和换手率 | 绝对误差不超过 `1e-10` |
+| 策略状态、decision ID、证据、诊断和拟议订单 | 语义字段完全一致，换手率按 ratio 容差 |
 | 生命周期顺序、数量和终态 | 规范化状态机完全一致 |
 
 任一检查失败，报告状态为 `blocked`，命令返回退出码 `3`。输入、哈希或引擎
@@ -141,10 +170,12 @@ PYTHONPATH=src python -m lets_quant reconcile-engine \
 
 ## 当前限制
 
-两个适配器 v1 都只接受 `standalone_prices_csv`、日线、只做多、零初始持仓，且
-同标的同执行日最多一笔订单。它们会拒绝清洗数据集中的停牌、公司行动和复权
-语义，因为这些能力尚未独立映射。
+VectorBT adapter v1 与 RQAlpha adapter v2 都只接受 `standalone_prices_csv`、
+日线、只做多、零初始持仓，且同标的同执行日最多一笔订单。它们会拒绝清洗
+数据集中的停牌、公司行动和复权语义，因为这些能力尚未独立映射。
 
-RQAlpha 已独立运行原生订单生命周期，但策略决策仍来自冻结信号；VectorBT 的
-可买数量仍是适配器 lowering。完整 M2 还需要第二引擎独立生成 PIT 决策，并把
-停牌、公司行动、非零初始持仓、容量与真实且有使用权的数据纳入复核。
+RQAlpha 默认通过独立模块复算当前支持的固定权重和动量策略，不导入参考
+`strategies.py`、`risk.py` 或 `backtest.py`；旧的 `frozen_orders` 模式只用于执行
+诊断。目标整手、换手率和现金缓冲仍是适配层规则，VectorBT 的可买数量也仍是
+adapter lowering。下一阶段需要把停牌、公司行动、非零初始持仓、容量与真实且
+有使用权的数据纳入复核。

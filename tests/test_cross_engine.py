@@ -12,6 +12,7 @@ from lets_quant.cross_engine import (
     EngineValidationError,
     file_sha256,
     read_nav_rows,
+    read_signal_rows,
     read_trade_rows,
     reconcile_engine_candidate,
     summarize_candidate,
@@ -23,14 +24,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CrossEngineTest(unittest.TestCase):
-    def _reference_run(self, temporary: Path) -> Path:
+    def _reference_run(
+        self, temporary: Path, policy_path: Path = None
+    ) -> Path:
+        policy_path = policy_path or ROOT / "config/policy.example.json"
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             exit_code = main(
                 [
                     "backtest",
                     "--policy",
-                    str(ROOT / "config/policy.example.json"),
+                    str(policy_path),
                     "--prices",
                     str(ROOT / "examples/prices.csv"),
                     "--output-root",
@@ -58,6 +62,32 @@ class CrossEngineTest(unittest.TestCase):
                 "input": "frozen_order_intents",
                 "validated_components": ["fixture normalization"],
                 "excluded_components": ["strategy validity"],
+            },
+            limitations=["test fixture only"],
+        )
+
+    def _policy_candidate_run(
+        self, temporary: Path, reference: Path
+    ) -> Path:
+        nav_rows = read_nav_rows(reference / "nav.csv")
+        trade_rows = read_trade_rows(reference / "trades.csv")
+        signal_rows = read_signal_rows(reference / "signals.csv")
+        return write_engine_candidate(
+            reference_directory=reference,
+            output_root=temporary / "policy-candidates",
+            engine={
+                "name": "test-policy-engine",
+                "version": "1.0",
+                "adapter_version": "1",
+            },
+            nav_rows=nav_rows,
+            trade_rows=trade_rows,
+            signal_rows=signal_rows,
+            metrics=summarize_candidate(nav_rows, trade_rows),
+            validation_scope={
+                "input": "independent_policy",
+                "validated_components": ["policy decisions"],
+                "excluded_components": ["market data validity"],
             },
             limitations=["test fixture only"],
         )
@@ -220,6 +250,75 @@ class CrossEngineTest(unittest.TestCase):
             self.assertEqual(exit_code, 0, stdout.getvalue())
             self.assertEqual(payload["status"], "pass")
             self.assertTrue(report_path.exists())
+
+    def test_policy_signal_candidate_reconciles_decisions_and_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            reference = self._reference_run(temporary)
+            candidate = self._policy_candidate_run(temporary, reference)
+
+            report = reconcile_engine_candidate(reference, candidate)
+
+            checks = {check["name"]: check for check in report["checks"]}
+            self.assertEqual(report["status"], "pass")
+            self.assertEqual(checks["policy_decisions"]["status"], "pass")
+            summary = report["summary"]["policy_decisions"]
+            self.assertTrue(summary["present"])
+            self.assertEqual(summary["candidate_signal_count"], 4)
+            self.assertEqual(summary["candidate_decision_count"], 4)
+
+    def test_blocked_signal_preserves_proposed_orders_for_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            policy = json.loads(
+                (ROOT / "config/policy.example.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            policy["name"] = "turnover-blocked-candidate"
+            policy["risk"]["max_turnover_per_rebalance"] = 0.1
+            policy_path = temporary / "policy.json"
+            policy_path.write_text(
+                json.dumps(policy, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            reference = self._reference_run(temporary, policy_path)
+
+            reference_signals = read_signal_rows(reference / "signals.csv")
+            self.assertTrue(reference_signals)
+            self.assertEqual(reference_signals[0]["status"], "blocked")
+            self.assertTrue(reference_signals[0]["orders"])
+
+            candidate = self._policy_candidate_run(temporary, reference)
+            report = reconcile_engine_candidate(reference, candidate)
+            self.assertEqual(report["status"], "pass")
+
+    def test_hash_consistent_policy_signal_drift_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            reference = self._reference_run(temporary)
+            candidate = self._policy_candidate_run(temporary, reference)
+            signals_path = candidate / "signals.csv"
+            signals_path.write_text(
+                signals_path.read_text(encoding="utf-8").replace(
+                    "passed pre-trade risk checks",
+                    "candidate decision drift",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            self._refresh_candidate_identity(candidate, "signals.csv")
+
+            report = reconcile_engine_candidate(reference, candidate)
+
+            checks = {check["name"]: check for check in report["checks"]}
+            self.assertEqual(report["status"], "blocked")
+            self.assertEqual(
+                checks["candidate_file_integrity"]["status"], "pass"
+            )
+            self.assertEqual(
+                checks["policy_decisions"]["status"], "blocked"
+            )
 
     def test_candidate_file_tampering_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

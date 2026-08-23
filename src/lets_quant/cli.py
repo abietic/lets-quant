@@ -243,8 +243,8 @@ def build_parser() -> argparse.ArgumentParser:
     rqalpha_validation = subcommands.add_parser(
         "validate-rqalpha",
         help=(
-            "execute frozen order intents in RQAlpha and reconcile native "
-            "order lifecycle artifacts"
+            "independently generate policy decisions in RQAlpha and reconcile "
+            "signals, execution, and native order lifecycle artifacts"
         ),
     )
     rqalpha_validation.add_argument(
@@ -259,6 +259,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--liquidity",
         type=Path,
         help="optional complete date/symbol/volume CSV for liquidity stress",
+    )
+    rqalpha_validation.add_argument(
+        "--decision-mode",
+        choices=("independent_policy", "frozen_orders"),
+        default="independent_policy",
+        help=(
+            "independent_policy validates PIT decisions and execution; "
+            "frozen_orders replays reference intents for execution diagnostics"
+        ),
     )
     rqalpha_validation.add_argument(
         "--volume-percent", type=float, default=1.0
@@ -722,6 +731,7 @@ def _validate_rqalpha(args: argparse.Namespace) -> int:
         reference_directory=args.reference_run,
         prices_path=args.prices,
         liquidity_path=args.liquidity,
+        decision_mode=args.decision_mode,
         volume_percent=args.volume_percent,
         output_root=args.output_root,
         money_tolerance=args.money_tolerance,

@@ -4,13 +4,14 @@ import csv
 import hashlib
 import json
 import math
+import re
 import statistics
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 NAV_FIELDS = ["date", "nav", "cash", "positions"]
 TRADE_FIELDS = [
     "signal_date",
@@ -28,6 +29,20 @@ TRADE_FIELDS = [
     "slippage_cost",
     "status",
 ]
+SIGNAL_FIELDS = [
+    "signal_date",
+    "execution_date",
+    "status",
+    "estimated_turnover",
+    "reason",
+    "decision_id",
+    "strategy_kind",
+    "target_weights",
+    "decision_evidence",
+    "diagnostics",
+    "orders",
+]
+SIGNAL_STATUSES = {"accepted", "blocked", "no_action"}
 ORDER_FIELDS = [
     "order_id",
     "signal_date",
@@ -392,6 +407,278 @@ def _parse_date_field(path: Path, line_number: int, field: str, value: Any) -> s
     return parsed
 
 
+def _parse_json_field(
+    path: Path, line_number: int, field: str, value: Any
+) -> Any:
+    try:
+        parsed = json.loads(str(value or ""))
+    except json.JSONDecodeError as exc:
+        raise EngineValidationError(
+            f"{path}:{line_number}:{field} must be valid JSON"
+        ) from exc
+    return _validated_json_value(
+        parsed, f"{path}:{line_number}:{field}"
+    )
+
+
+def _validated_json_value(value: Any, location: str) -> Any:
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise EngineValidationError(f"{location} contains a non-finite number")
+        return value
+    if isinstance(value, list):
+        return [
+            _validated_json_value(item, f"{location}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, dict):
+        normalized: Dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key:
+                raise EngineValidationError(
+                    f"{location} contains an invalid object key"
+                )
+            normalized[key] = _validated_json_value(
+                item, f"{location}.{key}"
+            )
+        return normalized
+    raise EngineValidationError(f"{location} contains an unsupported JSON value")
+
+
+def _parse_signal_weights(value: Any, location: str) -> Dict[str, float]:
+    if not isinstance(value, dict):
+        raise EngineValidationError(f"{location} must be a JSON object")
+    weights: Dict[str, float] = {}
+    for raw_symbol, raw_weight in value.items():
+        symbol = str(raw_symbol).strip().upper()
+        if not symbol or symbol in weights:
+            raise EngineValidationError(
+                f"{location} contains an invalid or duplicate symbol"
+            )
+        if isinstance(raw_weight, bool):
+            raise EngineValidationError(f"{location}.{symbol} must be a number")
+        weight = _finite_float(raw_weight, f"{location}.{symbol}")
+        if weight < 0:
+            raise EngineValidationError(f"{location}.{symbol} must be >= 0")
+        weights[symbol] = weight
+    return dict(sorted(weights.items()))
+
+
+def _parse_signal_orders(
+    value: Any,
+    *,
+    path: Path,
+    line_number: int,
+    signal_date: str,
+    execution_date: str,
+) -> List[Dict[str, Any]]:
+    location = f"{path}:{line_number}:orders"
+    if not isinstance(value, list):
+        raise EngineValidationError(f"{location} must be a JSON array")
+    required = {
+        "signal_date",
+        "execution_date",
+        "symbol",
+        "side",
+        "quantity",
+        "signal_price",
+        "reason",
+    }
+    orders: List[Dict[str, Any]] = []
+    seen_symbols = set()
+    for index, raw_order in enumerate(value):
+        order_location = f"{location}[{index}]"
+        if not isinstance(raw_order, dict) or set(raw_order) != required:
+            raise EngineValidationError(
+                f"{order_location} must have exactly these fields: "
+                + ", ".join(sorted(required))
+            )
+        order_signal_date = str(raw_order["signal_date"]).strip()
+        order_execution_date = str(raw_order["execution_date"]).strip()
+        if order_signal_date != signal_date or order_execution_date != execution_date:
+            raise EngineValidationError(
+                f"{order_location} dates must match their signal row"
+            )
+        symbol = str(raw_order["symbol"]).strip().upper()
+        if not symbol or symbol in seen_symbols:
+            raise EngineValidationError(
+                f"{order_location}.symbol is invalid or duplicated"
+            )
+        seen_symbols.add(symbol)
+        side = str(raw_order["side"]).strip().upper()
+        if side not in {"BUY", "SELL"}:
+            raise EngineValidationError(
+                f"{order_location}.side must be BUY or SELL"
+            )
+        quantity = _non_negative_int(
+            raw_order["quantity"], f"{order_location}.quantity"
+        )
+        if quantity <= 0:
+            raise EngineValidationError(
+                f"{order_location}.quantity must be > 0"
+            )
+        signal_price = _finite_float(
+            raw_order["signal_price"], f"{order_location}.signal_price"
+        )
+        if signal_price <= 0:
+            raise EngineValidationError(
+                f"{order_location}.signal_price must be > 0"
+            )
+        reason = str(raw_order["reason"]).strip()
+        if not reason:
+            raise EngineValidationError(
+                f"{order_location}.reason must not be empty"
+            )
+        orders.append(
+            {
+                "signal_date": order_signal_date,
+                "execution_date": order_execution_date,
+                "symbol": symbol,
+                "side": side,
+                "quantity": quantity,
+                "signal_price": signal_price,
+                "reason": reason,
+            }
+        )
+    return orders
+
+
+def read_signal_rows(path: Path) -> List[Dict[str, Any]]:
+    try:
+        handle = path.open(newline="", encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise EngineValidationError(f"file not found: {path}") from exc
+    rows: List[Dict[str, Any]] = []
+    seen_signal_dates = set()
+    with handle:
+        reader = csv.DictReader(handle)
+        actual = set(reader.fieldnames or [])
+        required = set(SIGNAL_FIELDS)
+        if actual != required:
+            raise EngineValidationError(
+                f"{path} must have exactly these columns: "
+                + ", ".join(sorted(required))
+            )
+        for line_number, row in enumerate(reader, start=2):
+            signal_date = _parse_date_field(
+                path, line_number, "signal_date", row.get("signal_date")
+            )
+            execution_date = _parse_date_field(
+                path,
+                line_number,
+                "execution_date",
+                row.get("execution_date"),
+            )
+            if signal_date >= execution_date:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:execution_date must follow signal_date"
+                )
+            if signal_date in seen_signal_dates:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:duplicate signal_date {signal_date}"
+                )
+            seen_signal_dates.add(signal_date)
+            status = str(row.get("status") or "").strip()
+            if status not in SIGNAL_STATUSES:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:unsupported signal status {status}"
+                )
+            turnover = _finite_float(
+                row.get("estimated_turnover"),
+                f"{path}:{line_number}:estimated_turnover",
+            )
+            if turnover < 0:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:estimated_turnover must be >= 0"
+                )
+            reason = str(row.get("reason") or "").strip()
+            if not reason:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:reason must not be empty"
+                )
+            decision_id = str(row.get("decision_id") or "").strip()
+            if decision_id and re.fullmatch(r"[0-9a-f]{64}", decision_id) is None:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:decision_id must be lowercase SHA-256"
+                )
+            strategy_kind = str(row.get("strategy_kind") or "").strip()
+            target_weights = _parse_signal_weights(
+                _parse_json_field(
+                    path, line_number, "target_weights", row.get("target_weights")
+                ),
+                f"{path}:{line_number}:target_weights",
+            )
+            evidence = _parse_json_field(
+                path,
+                line_number,
+                "decision_evidence",
+                row.get("decision_evidence"),
+            )
+            if not isinstance(evidence, dict):
+                raise EngineValidationError(
+                    f"{path}:{line_number}:decision_evidence must be a JSON object"
+                )
+            diagnostics = _parse_json_field(
+                path, line_number, "diagnostics", row.get("diagnostics")
+            )
+            if not isinstance(diagnostics, list) or not all(
+                isinstance(item, str) and item.strip() for item in diagnostics
+            ):
+                raise EngineValidationError(
+                    f"{path}:{line_number}:diagnostics must contain strings"
+                )
+            orders = _parse_signal_orders(
+                _parse_json_field(
+                    path, line_number, "orders", row.get("orders")
+                ),
+                path=path,
+                line_number=line_number,
+                signal_date=signal_date,
+                execution_date=execution_date,
+            )
+            if status == "accepted" and not orders:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:accepted signal requires orders"
+                )
+            if status == "no_action" and orders:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:no_action signal cannot contain orders"
+                )
+            if status in {"accepted", "no_action"} and not decision_id:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:{status} signal requires a decision_id"
+                )
+            if decision_id:
+                if not strategy_kind or not target_weights or not evidence:
+                    raise EngineValidationError(
+                        f"{path}:{line_number}:decision fields are incomplete"
+                    )
+            elif target_weights or evidence or diagnostics:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:decision payload requires a decision_id"
+                )
+            rows.append(
+                {
+                    "signal_date": signal_date,
+                    "execution_date": execution_date,
+                    "status": status,
+                    "estimated_turnover": turnover,
+                    "reason": reason,
+                    "decision_id": decision_id,
+                    "strategy_kind": strategy_kind,
+                    "target_weights": target_weights,
+                    "decision_evidence": evidence,
+                    "diagnostics": diagnostics,
+                    "orders": orders,
+                }
+            )
+    return rows
+
+
 def read_order_rows(path: Path) -> List[Dict[str, Any]]:
     try:
         handle = path.open(newline="", encoding="utf-8")
@@ -496,8 +783,6 @@ def read_order_rows(path: Path) -> List[Dict[str, Any]]:
                     f"{path}:{line_number}:avg_fill_price must be > 0 for a fill"
                 )
             rows.append(parsed)
-    if not rows:
-        raise EngineValidationError(f"{path} contains no order rows")
     return rows
 
 
@@ -611,8 +896,6 @@ def read_event_rows(path: Path) -> List[Dict[str, Any]]:
                     f"{path}:{line_number}:positive fill requires fill_price > 0"
                 )
             rows.append(parsed)
-    if not rows:
-        raise EngineValidationError(f"{path} contains no event rows")
     return rows
 
 
@@ -755,6 +1038,7 @@ def write_engine_candidate(
     limitations: Sequence[str],
     order_rows: Optional[Sequence[Mapping[str, Any]]] = None,
     event_rows: Optional[Sequence[Mapping[str, Any]]] = None,
+    signal_rows: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Path:
     engine_name = engine.get("name")
     engine_version = engine.get("version")
@@ -776,13 +1060,16 @@ def write_engine_candidate(
         raise EngineValidationError(
             "order_rows and event_rows must be supplied together"
         )
-    if order_rows is not None and (not order_rows or not event_rows):
-        raise EngineValidationError(
-            "order lifecycle evidence must contain orders and events"
-        )
     normalized_scope = _validated_scope(
         validation_scope, "validation_scope"
     )
+    if (
+        normalized_scope["input"] == "independent_policy"
+        and signal_rows is None
+    ):
+        raise EngineValidationError(
+            "independent_policy candidates must contain signal_rows"
+        )
     missing_metrics = sorted(set(METRIC_FIELDS) - set(metrics))
     if missing_metrics:
         raise EngineValidationError(
@@ -844,6 +1131,46 @@ def write_engine_candidate(
         destination / "metrics.json",
         {field: metrics[field] for field in METRIC_FIELDS},
     )
+    if signal_rows is not None:
+        _write_csv(
+            destination / "signals.csv",
+            (
+                {
+                    "signal_date": str(row["signal_date"]),
+                    "execution_date": str(row["execution_date"]),
+                    "status": row["status"],
+                    "estimated_turnover": (
+                        f"{float(row['estimated_turnover']):.10f}"
+                    ),
+                    "reason": row["reason"],
+                    "decision_id": row.get("decision_id", ""),
+                    "strategy_kind": row.get("strategy_kind", ""),
+                    "target_weights": json.dumps(
+                        row.get("target_weights", {}),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "decision_evidence": json.dumps(
+                        row.get("decision_evidence", {}),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "diagnostics": json.dumps(
+                        row.get("diagnostics", []),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "orders": json.dumps(
+                        row.get("orders", []),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                }
+                for row in signal_rows
+            ),
+            SIGNAL_FIELDS,
+        )
+        read_signal_rows(destination / "signals.csv")
     if order_rows is not None and event_rows is not None:
         _write_csv(
             destination / "orders.csv",
@@ -884,6 +1211,8 @@ def write_engine_candidate(
                 for name in ("orders.csv", "events.csv")
             }
         )
+    if signal_rows is not None:
+        files["signals.csv"] = file_sha256(destination / "signals.csv")
     manifest: Dict[str, Any] = {
         "artifact_type": "engine_candidate",
         "schema_version": SCHEMA_VERSION,
@@ -1352,6 +1681,126 @@ def _validate_order_lifecycle(
     }
 
 
+def _validate_policy_signals(
+    reference_rows: Sequence[Mapping[str, Any]],
+    candidate_rows: Sequence[Mapping[str, Any]],
+    *,
+    ratio_tolerance: float,
+) -> Dict[str, Any]:
+    mismatches: List[Dict[str, Any]] = []
+    if len(reference_rows) != len(candidate_rows):
+        mismatches.append(
+            {
+                "field": "signal_count",
+                "expected": len(reference_rows),
+                "actual": len(candidate_rows),
+            }
+        )
+    exact_fields = (
+        "signal_date",
+        "execution_date",
+        "status",
+        "reason",
+        "decision_id",
+        "strategy_kind",
+        "target_weights",
+        "decision_evidence",
+        "diagnostics",
+    )
+    exact_order_fields = (
+        "signal_date",
+        "execution_date",
+        "symbol",
+        "side",
+        "quantity",
+        "reason",
+    )
+    for signal_index, (reference, candidate) in enumerate(
+        zip(reference_rows, candidate_rows)
+    ):
+        for field in exact_fields:
+            if reference[field] != candidate[field]:
+                mismatches.append(
+                    {
+                        "signal_index": signal_index,
+                        "field": field,
+                        "expected": reference[field],
+                        "actual": candidate[field],
+                    }
+                )
+        turnover_difference = abs(
+            float(reference["estimated_turnover"])
+            - float(candidate["estimated_turnover"])
+        )
+        if turnover_difference > ratio_tolerance:
+            mismatches.append(
+                {
+                    "signal_index": signal_index,
+                    "field": "estimated_turnover",
+                    "expected": reference["estimated_turnover"],
+                    "actual": candidate["estimated_turnover"],
+                    "difference": turnover_difference,
+                }
+            )
+        reference_orders = reference["orders"]
+        candidate_orders = candidate["orders"]
+        if len(reference_orders) != len(candidate_orders):
+            mismatches.append(
+                {
+                    "signal_index": signal_index,
+                    "field": "order_count",
+                    "expected": len(reference_orders),
+                    "actual": len(candidate_orders),
+                }
+            )
+        for order_index, (reference_order, candidate_order) in enumerate(
+            zip(reference_orders, candidate_orders)
+        ):
+            for field in exact_order_fields:
+                if reference_order[field] != candidate_order[field]:
+                    mismatches.append(
+                        {
+                            "signal_index": signal_index,
+                            "order_index": order_index,
+                            "field": f"order_{field}",
+                            "expected": reference_order[field],
+                            "actual": candidate_order[field],
+                        }
+                    )
+            price_difference = abs(
+                float(reference_order["signal_price"])
+                - float(candidate_order["signal_price"])
+            )
+            if price_difference > 1e-8:
+                mismatches.append(
+                    {
+                        "signal_index": signal_index,
+                        "order_index": order_index,
+                        "field": "order_signal_price",
+                        "expected": reference_order["signal_price"],
+                        "actual": candidate_order["signal_price"],
+                        "difference": price_difference,
+                    }
+                )
+    return {
+        "passed": not mismatches,
+        "details": {
+            "reference_signal_count": len(reference_rows),
+            "candidate_signal_count": len(candidate_rows),
+            "reference_decision_count": sum(
+                1 for row in reference_rows if row["decision_id"]
+            ),
+            "candidate_decision_count": sum(
+                1 for row in candidate_rows if row["decision_id"]
+            ),
+            "candidate_accepted_count": sum(
+                1 for row in candidate_rows if row["status"] == "accepted"
+            ),
+            "mismatches": _differences_limited(mismatches),
+        },
+    }
+
+
 def reconcile_engine_candidate(
     reference_directory: Path,
     candidate_directory: Path,
@@ -1472,25 +1921,44 @@ def reconcile_engine_candidate(
 
     base_candidate_files = {"metrics.json", "nav.csv", "trades.csv"}
     lifecycle_candidate_files = {"orders.csv", "events.csv"}
+    decision_candidate_files = {"signals.csv"}
     declared_file_names = set(declared_files)
     lifecycle_present = lifecycle_candidate_files.issubset(declared_file_names)
+    decisions_present = decision_candidate_files.issubset(declared_file_names)
     valid_candidate_file_sets = {
         frozenset(base_candidate_files),
         frozenset(base_candidate_files | lifecycle_candidate_files),
+        frozenset(base_candidate_files | decision_candidate_files),
+        frozenset(
+            base_candidate_files
+            | lifecycle_candidate_files
+            | decision_candidate_files
+        ),
     }
     file_mismatches: List[Dict[str, Any]] = []
     if frozenset(declared_file_names) not in valid_candidate_file_sets:
         file_mismatches.append(
             {
                 "field": "file_set",
-                "expected": [
-                    sorted(base_candidate_files),
-                    sorted(base_candidate_files | lifecycle_candidate_files),
-                ],
+                "expected": sorted(
+                    sorted(value) for value in valid_candidate_file_sets
+                ),
                 "actual": sorted(str(name) for name in declared_files),
             }
         )
-    allowed_candidate_files = base_candidate_files | lifecycle_candidate_files
+    if validation_scope["input"] == "independent_policy" and not decisions_present:
+        file_mismatches.append(
+            {
+                "field": "signals.csv",
+                "expected": "required for independent_policy",
+                "actual": "missing",
+            }
+        )
+    allowed_candidate_files = (
+        base_candidate_files
+        | lifecycle_candidate_files
+        | decision_candidate_files
+    )
     for name in sorted(allowed_candidate_files & declared_file_names):
         actual_hash = file_sha256(candidate_directory / name)
         if declared_files.get(name) != actual_hash:
@@ -1671,6 +2139,30 @@ def reconcile_engine_candidate(
             },
         )
     )
+    decision_summary: Dict[str, Any] = {"present": False}
+    if decisions_present:
+        reference_signals = read_signal_rows(
+            reference_directory / "signals.csv"
+        )
+        candidate_signals = read_signal_rows(
+            candidate_directory / "signals.csv"
+        )
+        decision_result = _validate_policy_signals(
+            reference_signals,
+            candidate_signals,
+            ratio_tolerance=ratio_tolerance,
+        )
+        decision_summary = {
+            "present": True,
+            **decision_result["details"],
+        }
+        checks.append(
+            _check(
+                "policy_decisions",
+                decision_result["passed"],
+                decision_result["details"],
+            )
+        )
     lifecycle_summary: Dict[str, Any] = {"present": False}
     if lifecycle_present:
         order_rows = read_order_rows(candidate_directory / "orders.csv")
@@ -1791,6 +2283,7 @@ def reconcile_engine_candidate(
             "blocked_check_count": sum(
                 1 for check in checks if check["status"] == "blocked"
             ),
+            "policy_decisions": decision_summary,
             "order_lifecycle": lifecycle_summary,
         },
         "investment_validity_established": False,

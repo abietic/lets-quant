@@ -30,7 +30,9 @@ flowchart LR
 
     G --> V1["冻结订单意图"]
     V1 --> V2["规则 lowering 与 VectorBT 组合会计"]
-    V1 --> R1["RQAlpha 事件循环与原生撮合"]
+    E2 --> RP["独立 PIT 策略与风险复算"]
+    RP --> R1["RQAlpha 事件循环与原生撮合"]
+    V1 -. "frozen_orders 诊断" .-> R1
     H --> V3["跨引擎规范化对账"]
     V2 --> V3
     R1 --> R2["订单与事件生命周期证据"]
@@ -61,11 +63,12 @@ flowchart LR
 | `backtest.py` | 日线参考模拟、费用、回撤冻结 | 真实盘口撮合 |
 | `accounting.py` | 交易和公司行动分录、每日资产对账 | 税务批次、碎股处置 |
 | `strategies.py` | PIT-safe 历史上下文、策略决策和证据 | 访问未来数据、直接下单 |
+| `independent_policy.py` | 为第二引擎独立复算固定权重/动量决策、目标整手和换手率门禁 | 复用参考策略/风险/回测实现、提交订单 |
 | `experiments.py` | 滚动时间折、参数敏感性、执行压力和结果摘要 | 自动调参、证明投资有效性 |
 | `cross_engine.py` | 候选引擎契约、输入绑定、文件校验和差异报告 | 生成策略信号、判定投资有效性 |
 | `engine_inputs.py` | 严格加载跨引擎共享的冻结行情和订单意图 | 决定成交或读取参考成交 |
 | `vectorbt_adapter.py` | 将冻结订单意图 lowering 后交给 VectorBT 复核组合会计 | 独立生成信号、原生复核仓位缩减、盘中撮合 |
-| `rqalpha_adapter.py` | 用冻结日线驱动 RQAlpha 原生事件、撮合、费用和账户 | 独立生成信号、真实盘口或券商执行 |
+| `rqalpha_adapter.py` | 用冻结日线独立生成 PIT 信号并驱动 RQAlpha 原生事件、撮合、费用和账户 | 真实盘口、券商执行、证明策略有效 |
 | `scenarios.py` | 确定性合成市场和故障场景 | 模拟真实收益分布 |
 | `orders.py` | 生成可审阅订单计划 | 下单、撤单、修改账户 |
 | `execution/paper.py` | 离线订单事件、幂等、状态恢复和账户对账 | 联网、生成成交、券商真相源 |
@@ -103,6 +106,8 @@ flowchart LR
 - 跨引擎候选必须绑定参考输入和结果哈希；对账前不得读取参考成交来决定候选成交。
 - 事件驱动候选的订单和事件文件必须成对存在并参与 candidate ID；事件序号、
   状态迁移、累计成交、费用、终态和规范化成交必须互相一致。
+- 独立策略候选必须包含参与 candidate ID 的 `signals.csv`；决策状态、ID、目标
+  权重、PIT 证据、换手率和拟议订单必须与参考信号逐项对账。
 - 跨引擎 `pass` 只覆盖 manifest 声明的执行与会计范围，始终保持
   `investment_validity_established=false` 和 `automatic_execution_allowed=false`。
 - 未复权价格中的公司行动必须显式入账；复权数据只记录事件，禁止重复改变资产。
