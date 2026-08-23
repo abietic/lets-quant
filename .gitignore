@@ -6,6 +6,7 @@ __pycache__/
 .ruff_cache/
 .venv/
 .venv-vectorbt/
+.venv-rqalpha/
 .env
 .env.*
 !.env.example

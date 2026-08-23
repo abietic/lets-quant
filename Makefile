@@ -1,7 +1,7 @@
 PYTHON ?= python3
 PYTHONPATH := $(CURDIR)/src
 
-.PHONY: check compile lint test validate demo plan m1-validate m1-demo m15-demo m2-demo paper-demo paper-audit-demo vectorbt-test vectorbt-demo
+.PHONY: check compile lint test validate demo plan m1-validate m1-demo m15-demo m2-demo paper-demo paper-audit-demo vectorbt-test vectorbt-demo rqalpha-test rqalpha-demo
 
 check: compile test
 
@@ -105,5 +105,20 @@ vectorbt-demo:
 		--prices examples/prices.csv \
 		| $(PYTHON) -c 'import json,sys; print(json.load(sys.stdin)["artifact_directory"])')"; \
 	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant validate-vectorbt \
+		--reference-run "$$reference_dir" \
+		--prices examples/prices.csv
+
+rqalpha-test:
+	$(PYTHON) -c 'import rqalpha; assert rqalpha.__version__ == "6.3.0"'
+	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m unittest \
+		tests.test_rqalpha_adapter -v
+
+rqalpha-demo:
+	@set -eu; \
+	reference_dir="$$(PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant backtest \
+		--policy config/policy.example.json \
+		--prices examples/prices.csv \
+		| $(PYTHON) -c 'import json,sys; print(json.load(sys.stdin)["artifact_directory"])')"; \
+	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant validate-rqalpha \
 		--reference-run "$$reference_dir" \
 		--prices examples/prices.csv

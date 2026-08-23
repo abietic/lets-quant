@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lets-quant"
-version = "0.7.0"
+version = "0.8.0"
 description = "A local-first, research-only personal quantitative investing toolkit"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -19,6 +19,9 @@ akshare = ["akshare==1.18.79"]
 dev = ["ruff==0.16.4"]
 vectorbt = [
   "vectorbt==1.1.0; python_version >= '3.11' and python_version < '3.15'",
+]
+rqalpha = [
+  "rqalpha==6.3.0; python_version >= '3.9' and python_version < '3.15'",
 ]
 
 [project.scripts]

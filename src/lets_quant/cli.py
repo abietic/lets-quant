@@ -47,6 +47,7 @@ from .orders import build_manual_order_plan
 from .providers import DailyBarsRequest
 from .providers.akshare import AkshareEtfDailyBarsProvider
 from .research import ResearchPolicyError, load_research_policy
+from .rqalpha_adapter import run_rqalpha_validation
 from .scenarios import (
     SUPPORTED_SYNTHETIC_SCENARIOS,
     generate_synthetic_market,
@@ -236,6 +237,41 @@ def build_parser() -> argparse.ArgumentParser:
         "--money-tolerance", type=float, default=1e-6
     )
     vectorbt_validation.add_argument(
+        "--ratio-tolerance", type=float, default=1e-10
+    )
+
+    rqalpha_validation = subcommands.add_parser(
+        "validate-rqalpha",
+        help=(
+            "execute frozen order intents in RQAlpha and reconcile native "
+            "order lifecycle artifacts"
+        ),
+    )
+    rqalpha_validation.add_argument(
+        "--reference-run", type=Path, required=True
+    )
+    rqalpha_validation.add_argument(
+        "--prices",
+        type=Path,
+        help="price CSV; defaults to the path bound by the reference manifest",
+    )
+    rqalpha_validation.add_argument(
+        "--liquidity",
+        type=Path,
+        help="optional complete date/symbol/volume CSV for liquidity stress",
+    )
+    rqalpha_validation.add_argument(
+        "--volume-percent", type=float, default=1.0
+    )
+    rqalpha_validation.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("artifacts/engine-validation"),
+    )
+    rqalpha_validation.add_argument(
+        "--money-tolerance", type=float, default=1e-6
+    )
+    rqalpha_validation.add_argument(
         "--ratio-tolerance", type=float, default=1e-10
     )
 
@@ -681,6 +717,36 @@ def _validate_vectorbt(args: argparse.Namespace) -> int:
     return 0 if report["status"] == "pass" else 3
 
 
+def _validate_rqalpha(args: argparse.Namespace) -> int:
+    destination, report = run_rqalpha_validation(
+        reference_directory=args.reference_run,
+        prices_path=args.prices,
+        liquidity_path=args.liquidity,
+        volume_percent=args.volume_percent,
+        output_root=args.output_root,
+        money_tolerance=args.money_tolerance,
+        ratio_tolerance=args.ratio_tolerance,
+    )
+    print(
+        json.dumps(
+            {
+                "status": report["status"],
+                "candidate_directory": str(destination.resolve()),
+                "report_path": str(
+                    (destination / "reconciliation.json").resolve()
+                ),
+                "report_sha256": report["report_sha256"],
+                "summary": report["summary"],
+                "investment_validity_established": False,
+                "automatic_execution_allowed": False,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0 if report["status"] == "pass" else 3
+
+
 def _reconcile_engine(args: argparse.Namespace) -> int:
     report = reconcile_engine_candidate(
         args.reference_run,
@@ -734,6 +800,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _audit_paper_state(args)
         if args.command == "validate-vectorbt":
             return _validate_vectorbt(args)
+        if args.command == "validate-rqalpha":
+            return _validate_rqalpha(args)
         if args.command == "reconcile-engine":
             return _reconcile_engine(args)
     except (

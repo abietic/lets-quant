@@ -19,6 +19,7 @@
 - 多个滚动时间折和邻近策略参数敏感性矩阵，不自动选择最优参数。
 - 带严格输入指纹和差异报告的跨引擎候选产物契约与对账器。
 - 可选 VectorBT 1.1.0 适配器，规则 lowering 后复核成交、费用、持仓和 NAV。
+- 可选 RQAlpha 6.3.0 事件驱动适配器，原生复核订单、部分成交、撤拒单和账户。
 - 六类确定性合成市场，用于验证软件语义和失败边界。
 - 显式现金/持仓账本、公司行动入账和每日资产恒等式校验。
 - 可持久化的离线 paper 订单状态机、事件幂等和重启恢复。
@@ -46,13 +47,18 @@ make paper-demo
 make paper-audit-demo
 ```
 
-核心命令仍是零运行时依赖。跨引擎适配器需要 Python 3.11+ 的独立环境：
+核心命令仍是零运行时依赖。跨引擎适配器使用独立环境：
 
 ```bash
 python3.13 -m venv .venv-vectorbt
 source .venv-vectorbt/bin/activate
 python -m pip install -e '.[vectorbt]'
 make vectorbt-test vectorbt-demo
+
+python3.9 -m venv .venv-rqalpha
+source .venv-rqalpha/bin/activate
+python -m pip install -e '.[rqalpha]'
+make rqalpha-test rqalpha-demo
 ```
 
 `make m1-demo` 使用短小的合成行情跑通“原始快照 -> point-in-time
@@ -167,24 +173,28 @@ make m2-demo
 
 ## M2 跨引擎执行对账
 
-`validate-vectorbt` 不读取参考成交来生成候选结果。它读取冻结的订单意图和绑定
-哈希的原始价格。适配器将动态现金缓冲、卖出优先、整手、佣金、最低佣金、
-卖出税和滑点映射成 VectorBT 订单，再由 VectorBT 独立生成共享现金、持仓、NAV
-和订单记录，最后逐项核对：
+两个适配器都不读取参考成交来决定候选结果。它们读取冻结的订单意图和绑定哈希
+的原始价格。VectorBT 独立生成共享现金、持仓、NAV 和订单记录；RQAlpha 通过
+原生事件循环生成订单受理、成交、部分成交后撤余单、拒单、费用和账户变化：
 
 ```bash
 PYTHONPATH=src python -m lets_quant validate-vectorbt \
   --reference-run artifacts/runs/<run-id> \
   --prices examples/prices.csv
+
+PYTHONPATH=src python -m lets_quant validate-rqalpha \
+  --reference-run artifacts/runs/<run-id> \
+  --prices examples/prices.csv
 ```
 
-候选目录包含带 SHA-256 的 manifest、规范化 NAV、成交、指标和
-`reconciliation.json`。任何输入漂移、文件篡改、数量/状态差异或超过容差的数值
-偏差都会进入 `blocked`，命令返回退出码 `3`。
+候选目录包含带 SHA-256 的 manifest、规范化 NAV、成交、指标和对账报告。
+RQAlpha 候选还包含 `orders.csv` 与 `events.csv`；对账器会验证事件顺序、累计
+成交、费用和最终状态。任何输入漂移、文件篡改或结果差异都会进入 `blocked`，
+命令返回退出码 `3`。
 
-当前只独立验证 lowering 后的组合会计，不独立生成策略信号，也不独立证明动态
-现金缓冲下的可买数量公式；只支持独立 CSV、零初始持仓、只做多日线运行，清洗
-数据集中的停牌和公司行动会 fail closed。
+RQAlpha 的成交数量和生命周期由引擎原生生成；现金缓冲的暂存/恢复仍是适配层
+映射。两个适配器都不独立生成策略信号，只支持独立 CSV、零初始持仓、只做多
+日线运行，清洗数据集中的停牌和公司行动会 fail closed。
 完整契约与扩展方法见
 [跨引擎验证](docs/CROSS_ENGINE_VALIDATION.md)。
 
@@ -330,14 +340,15 @@ AKShare 的 MIT 许可是代码许可，不等于其上游行情的再分发或�
 - 当前滚动时间折会在每个窗口重置组合，但不会训练或拟合模型；它是时间稳定性
   检查，不是机器学习意义上的完整 walk-forward retraining。
 
-在使用真实资金前，应使用 RQAlpha、目标券商回测环境或其他成熟引擎进行
-第二套独立验证，并在模拟盘中核对订单、成交和持仓。
+当前已经接入 RQAlpha 作为第二个事件驱动验证引擎；使用真实资金前仍需在目标
+券商回测和模拟环境核对订单、成交、持仓及恢复真相源。
 
 ## 项目文档
 
 - [架构和安全不变量](docs/ARCHITECTURE.md)
 - [分阶段路线图](docs/ROADMAP.md)
 - [M1 数据管道](docs/DATA_PIPELINE.md)
+- [跨引擎验证](docs/CROSS_ENGINE_VALIDATION.md)
 - [离线 Paper 运营审计](docs/PAPER_OPERATIONS.md)
 
 本项目不提供投资建议。接入中国证券市场自动交易前，需要向开户券商确认

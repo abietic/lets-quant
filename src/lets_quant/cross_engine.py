@@ -7,10 +7,10 @@ import math
 import statistics
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 NAV_FIELDS = ["date", "nav", "cash", "positions"]
 TRADE_FIELDS = [
     "signal_date",
@@ -28,6 +28,48 @@ TRADE_FIELDS = [
     "slippage_cost",
     "status",
 ]
+ORDER_FIELDS = [
+    "order_id",
+    "signal_date",
+    "execution_date",
+    "symbol",
+    "side",
+    "requested_quantity",
+    "filled_quantity",
+    "avg_fill_price",
+    "commission",
+    "tax",
+    "final_status",
+    "event_count",
+    "trade_count",
+]
+EVENT_FIELDS = [
+    "sequence",
+    "event_time",
+    "event_type",
+    "order_id",
+    "trade_id",
+    "symbol",
+    "side",
+    "requested_quantity",
+    "cumulative_filled_quantity",
+    "event_fill_quantity",
+    "order_status",
+    "fill_price",
+    "commission",
+    "tax",
+    "message",
+]
+FINAL_ORDER_STATUSES = {"FILLED", "CANCELLED", "REJECTED"}
+ORDER_STATUSES = FINAL_ORDER_STATUSES | {"PENDING_NEW", "ACTIVE"}
+ORDER_EVENT_TYPES = {
+    "order_pending_new",
+    "order_creation_pass",
+    "order_creation_reject",
+    "trade",
+    "order_cancellation_pass",
+    "order_unsolicited_update",
+}
 METRIC_FIELDS = [
     "starting_nav",
     "ending_nav",
@@ -339,6 +381,241 @@ def read_trade_rows(
     return rows
 
 
+def _parse_date_field(path: Path, line_number: int, field: str, value: Any) -> str:
+    parsed = str(value or "").strip()
+    try:
+        datetime.strptime(parsed, "%Y-%m-%d")
+    except ValueError as exc:
+        raise EngineValidationError(
+            f"{path}:{line_number}:{field} must be YYYY-MM-DD"
+        ) from exc
+    return parsed
+
+
+def read_order_rows(path: Path) -> List[Dict[str, Any]]:
+    try:
+        handle = path.open(newline="", encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise EngineValidationError(f"file not found: {path}") from exc
+    rows: List[Dict[str, Any]] = []
+    seen_order_ids = set()
+    with handle:
+        reader = csv.DictReader(handle)
+        actual = set(reader.fieldnames or [])
+        required = set(ORDER_FIELDS)
+        if actual != required:
+            raise EngineValidationError(
+                f"{path} must have exactly these columns: "
+                + ", ".join(sorted(required))
+            )
+        for line_number, row in enumerate(reader, start=2):
+            order_id = str(row.get("order_id") or "").strip()
+            if not order_id:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:order_id must not be empty"
+                )
+            if order_id in seen_order_ids:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:duplicate order_id {order_id}"
+                )
+            seen_order_ids.add(order_id)
+            symbol = str(row.get("symbol") or "").strip().upper()
+            side = str(row.get("side") or "").strip().upper()
+            final_status = str(row.get("final_status") or "").strip().upper()
+            if not symbol:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:symbol must not be empty"
+                )
+            if side not in {"BUY", "SELL"}:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:side must be BUY or SELL"
+                )
+            if final_status not in FINAL_ORDER_STATUSES:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:final_status is unsupported"
+                )
+            parsed = {
+                "order_id": order_id,
+                "signal_date": _parse_date_field(
+                    path, line_number, "signal_date", row.get("signal_date")
+                ),
+                "execution_date": _parse_date_field(
+                    path,
+                    line_number,
+                    "execution_date",
+                    row.get("execution_date"),
+                ),
+                "symbol": symbol,
+                "side": side,
+                "requested_quantity": _non_negative_int(
+                    row.get("requested_quantity"),
+                    f"{path}:{line_number}:requested_quantity",
+                ),
+                "filled_quantity": _non_negative_int(
+                    row.get("filled_quantity"),
+                    f"{path}:{line_number}:filled_quantity",
+                ),
+                "avg_fill_price": _finite_float(
+                    row.get("avg_fill_price"),
+                    f"{path}:{line_number}:avg_fill_price",
+                ),
+                "commission": _finite_float(
+                    row.get("commission"),
+                    f"{path}:{line_number}:commission",
+                ),
+                "tax": _finite_float(
+                    row.get("tax"), f"{path}:{line_number}:tax"
+                ),
+                "final_status": final_status,
+                "event_count": _non_negative_int(
+                    row.get("event_count"),
+                    f"{path}:{line_number}:event_count",
+                ),
+                "trade_count": _non_negative_int(
+                    row.get("trade_count"),
+                    f"{path}:{line_number}:trade_count",
+                ),
+            }
+            if parsed["requested_quantity"] <= 0:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:requested_quantity must be > 0"
+                )
+            if parsed["filled_quantity"] > parsed["requested_quantity"]:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:filled_quantity exceeds requested_quantity"
+                )
+            if any(
+                parsed[field] < 0
+                for field in ("avg_fill_price", "commission", "tax")
+            ):
+                raise EngineValidationError(
+                    f"{path}:{line_number}:money fields must be >= 0"
+                )
+            if parsed["filled_quantity"] > 0 and parsed["avg_fill_price"] <= 0:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:avg_fill_price must be > 0 for a fill"
+                )
+            rows.append(parsed)
+    if not rows:
+        raise EngineValidationError(f"{path} contains no order rows")
+    return rows
+
+
+def read_event_rows(path: Path) -> List[Dict[str, Any]]:
+    try:
+        handle = path.open(newline="", encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise EngineValidationError(f"file not found: {path}") from exc
+    rows: List[Dict[str, Any]] = []
+    with handle:
+        reader = csv.DictReader(handle)
+        actual = set(reader.fieldnames or [])
+        required = set(EVENT_FIELDS)
+        if actual != required:
+            raise EngineValidationError(
+                f"{path} must have exactly these columns: "
+                + ", ".join(sorted(required))
+            )
+        for line_number, row in enumerate(reader, start=2):
+            event_time = str(row.get("event_time") or "").strip()
+            try:
+                parsed_time = datetime.fromisoformat(event_time)
+            except ValueError as exc:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:event_time must be ISO-8601"
+                ) from exc
+            if parsed_time.tzinfo is None:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:event_time must include a timezone"
+                )
+            event_type = str(row.get("event_type") or "").strip()
+            order_id = str(row.get("order_id") or "").strip()
+            trade_id = str(row.get("trade_id") or "").strip()
+            symbol = str(row.get("symbol") or "").strip().upper()
+            side = str(row.get("side") or "").strip().upper()
+            order_status = str(row.get("order_status") or "").strip().upper()
+            if event_type not in ORDER_EVENT_TYPES:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:unsupported event_type {event_type}"
+                )
+            if not order_id or not symbol:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:order_id and symbol must not be empty"
+                )
+            if side not in {"BUY", "SELL"}:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:side must be BUY or SELL"
+                )
+            if order_status not in ORDER_STATUSES:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:unsupported order_status"
+                )
+            if event_type == "trade" and not trade_id:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:trade event requires trade_id"
+                )
+            if event_type != "trade" and trade_id:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:non-trade event cannot have trade_id"
+                )
+            parsed = {
+                "sequence": _non_negative_int(
+                    row.get("sequence"), f"{path}:{line_number}:sequence"
+                ),
+                "event_time": event_time,
+                "event_type": event_type,
+                "order_id": order_id,
+                "trade_id": trade_id,
+                "symbol": symbol,
+                "side": side,
+                "requested_quantity": _non_negative_int(
+                    row.get("requested_quantity"),
+                    f"{path}:{line_number}:requested_quantity",
+                ),
+                "cumulative_filled_quantity": _non_negative_int(
+                    row.get("cumulative_filled_quantity"),
+                    f"{path}:{line_number}:cumulative_filled_quantity",
+                ),
+                "event_fill_quantity": _non_negative_int(
+                    row.get("event_fill_quantity"),
+                    f"{path}:{line_number}:event_fill_quantity",
+                ),
+                "order_status": order_status,
+                "fill_price": _finite_float(
+                    row.get("fill_price"),
+                    f"{path}:{line_number}:fill_price",
+                ),
+                "commission": _finite_float(
+                    row.get("commission"),
+                    f"{path}:{line_number}:commission",
+                ),
+                "tax": _finite_float(
+                    row.get("tax"), f"{path}:{line_number}:tax"
+                ),
+                "message": str(row.get("message") or ""),
+            }
+            if parsed["sequence"] <= 0 or parsed["requested_quantity"] <= 0:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:sequence and requested_quantity must be > 0"
+                )
+            if parsed["cumulative_filled_quantity"] > parsed["requested_quantity"]:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:cumulative fill exceeds requested quantity"
+                )
+            if any(parsed[field] < 0 for field in ("fill_price", "commission", "tax")):
+                raise EngineValidationError(
+                    f"{path}:{line_number}:money fields must be >= 0"
+                )
+            if parsed["event_fill_quantity"] > 0 and parsed["fill_price"] <= 0:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:positive fill requires fill_price > 0"
+                )
+            rows.append(parsed)
+    if not rows:
+        raise EngineValidationError(f"{path} contains no event rows")
+    return rows
+
+
 def reference_identity(reference_directory: Path) -> Dict[str, Any]:
     reference_directory = reference_directory.resolve()
     manifest_path = reference_directory / "manifest.json"
@@ -476,6 +753,8 @@ def write_engine_candidate(
     metrics: Mapping[str, Any],
     validation_scope: Mapping[str, Any],
     limitations: Sequence[str],
+    order_rows: Optional[Sequence[Mapping[str, Any]]] = None,
+    event_rows: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Path:
     engine_name = engine.get("name")
     engine_version = engine.get("version")
@@ -492,6 +771,14 @@ def write_engine_candidate(
     ):
         raise EngineValidationError(
             "limitations must contain only non-empty strings"
+        )
+    if (order_rows is None) != (event_rows is None):
+        raise EngineValidationError(
+            "order_rows and event_rows must be supplied together"
+        )
+    if order_rows is not None and (not order_rows or not event_rows):
+        raise EngineValidationError(
+            "order lifecycle evidence must contain orders and events"
         )
     normalized_scope = _validated_scope(
         validation_scope, "validation_scope"
@@ -557,10 +844,46 @@ def write_engine_candidate(
         destination / "metrics.json",
         {field: metrics[field] for field in METRIC_FIELDS},
     )
+    if order_rows is not None and event_rows is not None:
+        _write_csv(
+            destination / "orders.csv",
+            (
+                {
+                    **{field: row[field] for field in ORDER_FIELDS},
+                    **{
+                        field: f"{float(row[field]):.8f}"
+                        for field in ("avg_fill_price", "commission", "tax")
+                    },
+                }
+                for row in order_rows
+            ),
+            ORDER_FIELDS,
+        )
+        _write_csv(
+            destination / "events.csv",
+            (
+                {
+                    **{field: row[field] for field in EVENT_FIELDS},
+                    **{
+                        field: f"{float(row[field]):.8f}"
+                        for field in ("fill_price", "commission", "tax")
+                    },
+                }
+                for row in event_rows
+            ),
+            EVENT_FIELDS,
+        )
     files = {
         name: file_sha256(destination / name)
         for name in ("metrics.json", "nav.csv", "trades.csv")
     }
+    if order_rows is not None:
+        files.update(
+            {
+                name: file_sha256(destination / name)
+                for name in ("orders.csv", "events.csv")
+            }
+        )
     manifest: Dict[str, Any] = {
         "artifact_type": "engine_candidate",
         "schema_version": SCHEMA_VERSION,
@@ -596,6 +919,437 @@ def _check(name: str, passed: bool, details: Mapping[str, Any]) -> Dict[str, Any
 
 def _differences_limited(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return items[:20]
+
+
+def _validate_order_lifecycle(
+    order_rows: Sequence[Mapping[str, Any]],
+    event_rows: Sequence[Mapping[str, Any]],
+    trade_rows: Sequence[Mapping[str, Any]],
+    *,
+    money_tolerance: float,
+) -> Dict[str, Any]:
+    mismatches: List[Dict[str, Any]] = []
+    expected_sequences = list(range(1, len(event_rows) + 1))
+    actual_sequences = [int(event["sequence"]) for event in event_rows]
+    if actual_sequences != expected_sequences:
+        mismatches.append(
+            {
+                "field": "global_event_sequence",
+                "expected": expected_sequences[:20],
+                "actual": actual_sequences[:20],
+            }
+        )
+    event_times = [
+        datetime.fromisoformat(str(event["event_time"])) for event in event_rows
+    ]
+    if any(
+        current < previous
+        for previous, current in zip(event_times, event_times[1:])
+    ):
+        mismatches.append({"field": "global_event_time_order"})
+
+    seen_trade_ids = set()
+    for event in event_rows:
+        if event["event_type"] != "trade":
+            continue
+        trade_id = str(event["trade_id"])
+        if trade_id in seen_trade_ids:
+            mismatches.append(
+                {"field": "duplicate_trade_id", "trade_id": trade_id}
+            )
+        seen_trade_ids.add(trade_id)
+
+    orders_by_id = {str(row["order_id"]): row for row in order_rows}
+    events_by_order: Dict[str, List[Mapping[str, Any]]] = {
+        order_id: [] for order_id in orders_by_id
+    }
+    for event in event_rows:
+        order_id = str(event["order_id"])
+        order = orders_by_id.get(order_id)
+        if order is None:
+            mismatches.append(
+                {"field": "orphan_event", "order_id": order_id}
+            )
+            continue
+        events_by_order[order_id].append(event)
+        for field in ("symbol", "side", "requested_quantity"):
+            if event[field] != order[field]:
+                mismatches.append(
+                    {
+                        "order_id": order_id,
+                        "field": f"event_{field}",
+                        "expected": order[field],
+                        "actual": event[field],
+                    }
+                )
+
+    candidate_trades_by_key: Dict[tuple, Mapping[str, Any]] = {}
+    for trade in trade_rows:
+        key = (
+            trade["signal_date"],
+            trade["execution_date"],
+            trade["symbol"],
+            trade["side"],
+            trade["requested_quantity"],
+        )
+        if key in candidate_trades_by_key:
+            mismatches.append(
+                {"field": "duplicate_candidate_trade", "key": list(key)}
+            )
+        candidate_trades_by_key[key] = trade
+
+    partial_order_count = 0
+    rejected_order_count = 0
+    cancelled_order_count = 0
+    for order_id, order in orders_by_id.items():
+        events = events_by_order[order_id]
+        if not events:
+            mismatches.append(
+                {"order_id": order_id, "field": "missing_events"}
+            )
+            continue
+        if len(events) != order["event_count"]:
+            mismatches.append(
+                {
+                    "order_id": order_id,
+                    "field": "event_count",
+                    "expected": order["event_count"],
+                    "actual": len(events),
+                }
+            )
+        if events[0]["event_type"] != "order_pending_new" or events[0][
+            "order_status"
+        ] != "PENDING_NEW":
+            mismatches.append(
+                {
+                    "order_id": order_id,
+                    "field": "initial_event",
+                    "actual": {
+                        "event_type": events[0]["event_type"],
+                        "order_status": events[0]["order_status"],
+                    },
+                }
+            )
+
+        creation_passed = False
+        final_seen = False
+        cumulative_fill = 0
+        trade_count = 0
+        weighted_fill_value = 0.0
+        commission = 0.0
+        tax = 0.0
+        for event_index, event in enumerate(events):
+            event_type = str(event["event_type"])
+            status = str(event["order_status"])
+            if str(event["event_time"])[:10] != order["execution_date"]:
+                mismatches.append(
+                    {
+                        "order_id": order_id,
+                        "field": "event_execution_date",
+                        "expected": order["execution_date"],
+                        "actual": str(event["event_time"])[:10],
+                    }
+                )
+            if final_seen:
+                mismatches.append(
+                    {
+                        "order_id": order_id,
+                        "field": "event_after_final_status",
+                        "event_index": event_index,
+                    }
+                )
+            if event_type != "trade":
+                if event["event_fill_quantity"] != 0:
+                    mismatches.append(
+                        {
+                            "order_id": order_id,
+                            "field": "non_trade_event_fill_quantity",
+                            "event_index": event_index,
+                            "actual": event["event_fill_quantity"],
+                        }
+                    )
+                for field in ("fill_price", "commission", "tax"):
+                    if float(event[field]) != 0.0:
+                        mismatches.append(
+                            {
+                                "order_id": order_id,
+                                "field": f"non_trade_{field}",
+                                "event_index": event_index,
+                                "actual": event[field],
+                            }
+                        )
+                if event["cumulative_filled_quantity"] != cumulative_fill:
+                    mismatches.append(
+                        {
+                            "order_id": order_id,
+                            "field": "non_trade_cumulative_filled_quantity",
+                            "event_index": event_index,
+                            "expected": cumulative_fill,
+                            "actual": event["cumulative_filled_quantity"],
+                        }
+                    )
+            if event_type == "order_pending_new":
+                if event_index != 0 or status != "PENDING_NEW":
+                    mismatches.append(
+                        {
+                            "order_id": order_id,
+                            "field": "pending_new_transition",
+                            "event_index": event_index,
+                        }
+                    )
+            elif event_type == "order_creation_pass":
+                if event_index != 1 or creation_passed or status != "ACTIVE":
+                    mismatches.append(
+                        {
+                            "order_id": order_id,
+                            "field": "creation_pass_transition",
+                            "event_index": event_index,
+                        }
+                    )
+                creation_passed = True
+            elif event_type == "order_creation_reject":
+                if event_index != 1 or creation_passed or status != "REJECTED":
+                    mismatches.append(
+                        {
+                            "order_id": order_id,
+                            "field": "creation_reject_transition",
+                            "event_index": event_index,
+                        }
+                    )
+                final_seen = True
+            elif event_type == "trade":
+                event_fill = int(event["event_fill_quantity"])
+                next_cumulative_fill = cumulative_fill + event_fill
+                expected_status = (
+                    "FILLED"
+                    if next_cumulative_fill == order["requested_quantity"]
+                    else "ACTIVE"
+                )
+                if (
+                    not creation_passed
+                    or event_fill <= 0
+                    or status != expected_status
+                ):
+                    mismatches.append(
+                        {
+                            "order_id": order_id,
+                            "field": "trade_transition",
+                            "event_index": event_index,
+                            "event_fill_quantity": event_fill,
+                            "expected_status": expected_status,
+                            "status": status,
+                        }
+                    )
+                trade_count += 1
+                cumulative_fill = next_cumulative_fill
+                weighted_fill_value += event_fill * float(event["fill_price"])
+                commission += float(event["commission"])
+                tax += float(event["tax"])
+                if cumulative_fill != event["cumulative_filled_quantity"]:
+                    mismatches.append(
+                        {
+                            "order_id": order_id,
+                            "field": "cumulative_filled_quantity",
+                            "expected": cumulative_fill,
+                            "actual": event["cumulative_filled_quantity"],
+                        }
+                    )
+                if status == "FILLED":
+                    if cumulative_fill != order["requested_quantity"]:
+                        mismatches.append(
+                            {
+                                "order_id": order_id,
+                                "field": "filled_status_quantity",
+                                "expected": order["requested_quantity"],
+                                "actual": cumulative_fill,
+                            }
+                        )
+                    final_seen = True
+            elif event_type in {
+                "order_cancellation_pass",
+                "order_unsolicited_update",
+            }:
+                valid_cancel = (
+                    status == "CANCELLED"
+                    and cumulative_fill < order["requested_quantity"]
+                )
+                valid_unsolicited_reject = (
+                    event_type == "order_unsolicited_update"
+                    and status == "REJECTED"
+                    and cumulative_fill == 0
+                )
+                if not creation_passed or not (
+                    valid_cancel or valid_unsolicited_reject
+                ):
+                    mismatches.append(
+                        {
+                            "order_id": order_id,
+                            "field": "final_update_status",
+                            "creation_passed": creation_passed,
+                            "filled_quantity": cumulative_fill,
+                            "actual_status": status,
+                        }
+                    )
+                final_seen = True
+
+        final_event_status = str(events[-1]["order_status"])
+        if not final_seen or final_event_status != order["final_status"]:
+            mismatches.append(
+                {
+                    "order_id": order_id,
+                    "field": "final_status",
+                    "expected": order["final_status"],
+                    "actual": final_event_status,
+                }
+            )
+        if order["final_status"] == "FILLED" and cumulative_fill != order[
+            "requested_quantity"
+        ]:
+            mismatches.append(
+                {
+                    "order_id": order_id,
+                    "field": "filled_order_quantity",
+                    "expected": order["requested_quantity"],
+                    "actual": cumulative_fill,
+                }
+            )
+        if order["final_status"] == "CANCELLED" and cumulative_fill >= order[
+            "requested_quantity"
+        ]:
+            mismatches.append(
+                {
+                    "order_id": order_id,
+                    "field": "cancelled_order_quantity",
+                    "requested": order["requested_quantity"],
+                    "actual": cumulative_fill,
+                }
+            )
+        if order["final_status"] == "REJECTED" and cumulative_fill != 0:
+            mismatches.append(
+                {
+                    "order_id": order_id,
+                    "field": "rejected_order_quantity",
+                    "actual": cumulative_fill,
+                }
+            )
+        for field, expected, actual in (
+            ("filled_quantity", order["filled_quantity"], cumulative_fill),
+            ("trade_count", order["trade_count"], trade_count),
+        ):
+            if expected != actual:
+                mismatches.append(
+                    {
+                        "order_id": order_id,
+                        "field": field,
+                        "expected": expected,
+                        "actual": actual,
+                    }
+                )
+        expected_avg_price = (
+            weighted_fill_value / cumulative_fill if cumulative_fill else 0.0
+        )
+        for field, expected, actual in (
+            ("avg_fill_price", order["avg_fill_price"], expected_avg_price),
+            ("commission", order["commission"], commission),
+            ("tax", order["tax"], tax),
+        ):
+            if abs(float(expected) - float(actual)) > money_tolerance:
+                mismatches.append(
+                    {
+                        "order_id": order_id,
+                        "field": field,
+                        "expected": expected,
+                        "actual": actual,
+                    }
+                )
+
+        trade_key = (
+            order["signal_date"],
+            order["execution_date"],
+            order["symbol"],
+            order["side"],
+            order["requested_quantity"],
+        )
+        candidate_trade = candidate_trades_by_key.pop(trade_key, None)
+        if candidate_trade is None:
+            mismatches.append(
+                {
+                    "order_id": order_id,
+                    "field": "missing_candidate_trade",
+                }
+            )
+        else:
+            expected_trade_status = (
+                "filled"
+                if order["final_status"] == "FILLED"
+                and cumulative_fill == order["requested_quantity"]
+                else "partial"
+                if cumulative_fill > 0
+                else "rejected"
+            )
+            for field, expected, actual in (
+                (
+                    "filled_quantity",
+                    cumulative_fill,
+                    candidate_trade["filled_quantity"],
+                ),
+                ("status", expected_trade_status, candidate_trade["status"]),
+            ):
+                if expected != actual:
+                    mismatches.append(
+                        {
+                            "order_id": order_id,
+                            "field": f"candidate_trade_{field}",
+                            "expected": expected,
+                            "actual": actual,
+                        }
+                    )
+            candidate_money_fields = [
+                ("commission", commission, candidate_trade["commission"]),
+                ("tax", tax, candidate_trade["tax"]),
+            ]
+            if cumulative_fill > 0:
+                candidate_money_fields.insert(
+                    0,
+                    (
+                        "fill_price",
+                        expected_avg_price,
+                        candidate_trade["fill_price"],
+                    ),
+                )
+            for field, expected, actual in candidate_money_fields:
+                if abs(float(expected) - float(actual)) > money_tolerance:
+                    mismatches.append(
+                        {
+                            "order_id": order_id,
+                            "field": f"candidate_trade_{field}",
+                            "expected": expected,
+                            "actual": actual,
+                        }
+                    )
+
+        if 0 < cumulative_fill < order["requested_quantity"]:
+            partial_order_count += 1
+        if order["final_status"] == "REJECTED":
+            rejected_order_count += 1
+        if order["final_status"] == "CANCELLED":
+            cancelled_order_count += 1
+
+    for key in candidate_trades_by_key:
+        mismatches.append(
+            {"field": "orphan_candidate_trade", "key": list(key)}
+        )
+    return {
+        "passed": not mismatches,
+        "details": {
+            "order_count": len(order_rows),
+            "event_count": len(event_rows),
+            "partial_order_count": partial_order_count,
+            "rejected_order_count": rejected_order_count,
+            "cancelled_order_count": cancelled_order_count,
+            "mismatches": _differences_limited(mismatches),
+        },
+    }
 
 
 def reconcile_engine_candidate(
@@ -716,17 +1470,28 @@ def reconcile_engine_candidate(
         )
     )
 
-    expected_candidate_files = {"metrics.json", "nav.csv", "trades.csv"}
+    base_candidate_files = {"metrics.json", "nav.csv", "trades.csv"}
+    lifecycle_candidate_files = {"orders.csv", "events.csv"}
+    declared_file_names = set(declared_files)
+    lifecycle_present = lifecycle_candidate_files.issubset(declared_file_names)
+    valid_candidate_file_sets = {
+        frozenset(base_candidate_files),
+        frozenset(base_candidate_files | lifecycle_candidate_files),
+    }
     file_mismatches: List[Dict[str, Any]] = []
-    if set(declared_files) != expected_candidate_files:
+    if frozenset(declared_file_names) not in valid_candidate_file_sets:
         file_mismatches.append(
             {
                 "field": "file_set",
-                "expected": sorted(expected_candidate_files),
+                "expected": [
+                    sorted(base_candidate_files),
+                    sorted(base_candidate_files | lifecycle_candidate_files),
+                ],
                 "actual": sorted(str(name) for name in declared_files),
             }
         )
-    for name in sorted(expected_candidate_files & set(declared_files)):
+    allowed_candidate_files = base_candidate_files | lifecycle_candidate_files
+    for name in sorted(allowed_candidate_files & declared_file_names):
         actual_hash = file_sha256(candidate_directory / name)
         if declared_files.get(name) != actual_hash:
             file_mismatches.append(
@@ -906,6 +1671,27 @@ def reconcile_engine_candidate(
             },
         )
     )
+    lifecycle_summary: Dict[str, Any] = {"present": False}
+    if lifecycle_present:
+        order_rows = read_order_rows(candidate_directory / "orders.csv")
+        event_rows = read_event_rows(candidate_directory / "events.csv")
+        lifecycle_result = _validate_order_lifecycle(
+            order_rows,
+            event_rows,
+            candidate_trades,
+            money_tolerance=money_tolerance,
+        )
+        lifecycle_summary = {
+            "present": True,
+            **lifecycle_result["details"],
+        }
+        checks.append(
+            _check(
+                "order_lifecycle",
+                lifecycle_result["passed"],
+                lifecycle_result["details"],
+            )
+        )
 
     reference_metrics = _load_json_object(reference_directory / "metrics.json")
     candidate_metrics = _load_json_object(candidate_directory / "metrics.json")
@@ -1005,6 +1791,7 @@ def reconcile_engine_candidate(
             "blocked_check_count": sum(
                 1 for check in checks if check["status"] == "blocked"
             ),
+            "order_lifecycle": lifecycle_summary,
         },
         "investment_validity_established": False,
         "automatic_execution_allowed": False,
