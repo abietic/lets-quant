@@ -28,6 +28,8 @@
   哈希和 summary。
 - 验证两个实验后按完整 case contract 对齐，输出输入差异和方向明确的逐 case
   指标差，不自动评优。
+- 扫描实验根目录、逐项严格验证、按实验身份识别重复或冲突结果，并生成只供人工
+  审核的确定性目录，不自动排名或清理。
 - 带严格输入指纹和差异报告的跨引擎候选产物契约与对账器。
 - 可选 VectorBT 1.1.0 适配器，消费独立 CSV 或清洗数据集，复核停牌拒绝、成交、
   企业行动回调、费用、持仓和 NAV。
@@ -60,6 +62,7 @@ make m2-demo
 make experiment-verify-demo
 make experiment-replay-demo
 make experiment-compare-demo
+make experiment-catalog-demo
 make paper-demo
 make paper-audit-demo
 ```
@@ -228,6 +231,21 @@ PYTHONPATH=src python3 -m lets_quant compare-experiments \
 `candidate - baseline` 指标差；报告固定保持 `ranking_performed=false` 和
 `preferred_experiment=null`。完整契约见
 [实验差异报告](docs/EXPERIMENT_COMPARISON.md)。
+
+实验数量增加后，可以一次扫描根目录：
+
+```bash
+PYTHONPATH=src python3 -m lets_quant catalog-experiments \
+  --experiments-root artifacts/experiments \
+  --catalog-out artifacts/catalogs/catalog.json
+```
+
+目录只扫描根目录的直接子目录，每项先通过完整实验验证，再按 `experiment_id`
+分组。它会把重复且结果一致的实验标为信息项，把同一身份的冲突结果、当前格式
+验证失败和无逐文件哈希的早期格式列为阻塞审核项。`pass`/`empty` 返回 `0`，
+`attention_required` 在成功写出报告后返回 `3`，输入或写出错误返回 `2`。报告不
+排名、不选优、不删除任何目录，也不证明产物来源真实性或策略有效性。完整契约见
+[实验目录与审核队列](docs/EXPERIMENT_CATALOG.md)。
 
 ## M2 参数稳定性实验
 
@@ -482,6 +500,7 @@ AKShare 的 MIT 许可是代码许可，不等于其上游行情的再分发或�
 - [实验产物验证](docs/EXPERIMENT_VERIFICATION.md)
 - [实验离线重放](docs/EXPERIMENT_REPLAY.md)
 - [实验差异报告](docs/EXPERIMENT_COMPARISON.md)
+- [实验目录与审核队列](docs/EXPERIMENT_CATALOG.md)
 - [跨引擎验证](docs/CROSS_ENGINE_VALIDATION.md)
 - [离线 Paper 运营审计](docs/PAPER_OPERATIONS.md)
 

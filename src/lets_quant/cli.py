@@ -38,6 +38,10 @@ from .experiments import (
     market_identity,
     run_experiment,
 )
+from .experiment_catalog import (
+    build_experiment_catalog,
+    write_experiment_catalog,
+)
 from .experiment_comparison import (
     compare_experiment_artifacts,
     write_experiment_comparison_report,
@@ -219,6 +223,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--candidate-run", type=Path, required=True
     )
     compare_experiments.add_argument("--report-out", type=Path)
+
+    catalog_experiments = subcommands.add_parser(
+        "catalog-experiments",
+        help="verify and inventory immediate child experiment directories",
+    )
+    catalog_experiments.add_argument(
+        "--experiments-root", type=Path, required=True
+    )
+    catalog_experiments.add_argument("--catalog-out", type=Path)
 
     plan = subcommands.add_parser(
         "plan-orders",
@@ -720,6 +733,27 @@ def _compare_experiments(args: argparse.Namespace) -> int:
     return 0
 
 
+def _catalog_experiments(args: argparse.Namespace) -> int:
+    catalog = build_experiment_catalog(args.experiments_root)
+    if args.catalog_out is not None:
+        write_experiment_catalog(catalog, args.catalog_out)
+        payload = {
+            "status": catalog["status"],
+            "catalog_path": str(args.catalog_out.resolve()),
+            "catalog_sha256": catalog["catalog_sha256"],
+            "summary": catalog["summary"],
+            "descriptive_only": True,
+            "ranking_performed": False,
+            "automatic_cleanup_performed": False,
+            "investment_validity_established": False,
+            "automatic_execution_allowed": False,
+        }
+    else:
+        payload = catalog
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 3 if catalog["status"] == "attention_required" else 0
+
+
 def _plan_orders(args: argparse.Namespace) -> int:
     policy = load_policy(args.policy)
     market, prices_path, dataset_manifest, _, _ = _load_market_source(
@@ -943,6 +977,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _replay_experiment(args)
         if args.command == "compare-experiments":
             return _compare_experiments(args)
+        if args.command == "catalog-experiments":
+            return _catalog_experiments(args)
         if args.command == "plan-orders":
             return _plan_orders(args)
         if args.command == "replay-paper-events":

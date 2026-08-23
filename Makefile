@@ -1,7 +1,7 @@
 PYTHON ?= python3
 PYTHONPATH := $(CURDIR)/src
 
-.PHONY: ci install-git-hooks check compile lint test validate demo plan m1-validate m1-demo m15-demo m2-demo experiment-verify-demo experiment-replay-demo experiment-compare-demo paper-demo paper-audit-demo vectorbt-test vectorbt-demo rqalpha-test rqalpha-demo
+.PHONY: ci install-git-hooks check compile lint test validate demo plan m1-validate m1-demo m15-demo m2-demo experiment-verify-demo experiment-replay-demo experiment-compare-demo experiment-catalog-demo paper-demo paper-audit-demo vectorbt-test vectorbt-demo rqalpha-test rqalpha-demo
 
 ci: lint check
 
@@ -121,8 +121,32 @@ experiment-compare-demo:
 		--scenario-trading-days 780 \
 		| $(PYTHON) -c 'import json,sys; print(json.load(sys.stdin)["artifact_directory"])')"; \
 	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant compare-experiments \
-		--baseline-run "$$baseline_dir" \
-		--candidate-run "$$candidate_dir"
+			--baseline-run "$$baseline_dir" \
+			--candidate-run "$$candidate_dir"
+
+experiment-catalog-demo:
+	@set -eu; \
+	work_dir="$$(mktemp -d)"; \
+	trap 'rm -rf "$$work_dir"' EXIT; \
+	experiments_root="$$work_dir/experiments"; \
+	mkdir -p "$$experiments_root"; \
+	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant run-experiment \
+		--policy config/policy.momentum.example.json \
+		--experiment config/experiment.m1_5.example.json \
+		--scenario regime_shift \
+		--scenario-start 2022-01-03 \
+		--scenario-trading-days 780 \
+		--output-root "$$experiments_root" >/dev/null; \
+	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant run-experiment \
+		--policy config/policy.momentum.example.json \
+		--experiment config/experiment.m1_5.example.json \
+		--scenario regime_shift \
+		--scenario-start 2022-01-03 \
+		--scenario-trading-days 780 \
+		--output-root "$$experiments_root" >/dev/null; \
+	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant catalog-experiments \
+		--experiments-root "$$experiments_root" \
+		--catalog-out "$$work_dir/catalog.json"
 
 paper-demo:
 	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant replay-paper-events \
