@@ -378,7 +378,7 @@ class RqalphaAdapterTest(unittest.TestCase):
             scope = manifest["validation_scope"]
             self.assertEqual(scope["bar_mapping"], "curated_ohlcv")
 
-    def test_unadjusted_corporate_actions_fail_before_simulation(self) -> None:
+    def test_unadjusted_cash_dividend_uses_native_accounting(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temporary = Path(temp_dir)
             fixture = build_curated_reference(
@@ -386,10 +386,7 @@ class RqalphaAdapterTest(unittest.TestCase):
                 adjustment="none",
             )
             stdout = io.StringIO()
-            stderr = io.StringIO()
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
-                stderr
-            ):
+            with contextlib.redirect_stdout(stdout):
                 exit_code = main(
                     [
                         "validate-rqalpha",
@@ -401,10 +398,122 @@ class RqalphaAdapterTest(unittest.TestCase):
                         str(temporary / "candidate"),
                     ]
                 )
+            payload = json.loads(stdout.getvalue())
 
-            self.assertEqual(exit_code, 2)
-            self.assertEqual(stdout.getvalue(), "")
-            self.assertIn("corporate-action accounting", stderr.getvalue())
+            self.assertEqual(exit_code, 0, payload)
+            self.assertEqual(payload["status"], "pass")
+            self.assertEqual(payload["summary"]["max_abs_cash_difference"], 0)
+            action_summary = payload["summary"]["corporate_actions"]
+            self.assertEqual(action_summary["candidate_explicit_action_count"], 1)
+            candidate = Path(payload["candidate_directory"])
+            with (candidate / "corporate_actions.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                actions = list(csv.DictReader(handle))
+            self.assertEqual(actions[0]["accounting_event_type"], "cash_dividend")
+            self.assertEqual(actions[0]["cash_delta"], "10.00000000")
+
+    def test_unadjusted_split_and_reverse_split_use_native_positions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            fixture = build_curated_reference(
+                temporary,
+                adjustment="none",
+                corporate_action_rows=[
+                    {
+                        "symbol": "510300.XSHG",
+                        "event_type": "split",
+                        "ex_date": "2025-01-06",
+                        "announced_at": "2025-01-02T09:00:00+08:00",
+                        "cash_amount": "",
+                        "ratio": "2",
+                        "available_at": "2025-01-02T09:00:00+08:00",
+                    },
+                    {
+                        "symbol": "510300.XSHG",
+                        "event_type": "reverse_split",
+                        "ex_date": "2025-01-07",
+                        "announced_at": "2025-01-02T09:00:00+08:00",
+                        "cash_amount": "",
+                        "ratio": "0.5",
+                        "available_at": "2025-01-02T09:00:00+08:00",
+                    },
+                ],
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "validate-rqalpha",
+                        "--reference-run",
+                        str(fixture["reference"]),
+                        "--dataset",
+                        str(fixture["dataset"]),
+                        "--output-root",
+                        str(temporary / "candidate"),
+                    ]
+                )
+            payload = json.loads(stdout.getvalue())
+
+            self.assertEqual(exit_code, 0, payload)
+            self.assertEqual(payload["status"], "pass")
+            self.assertEqual(payload["summary"]["max_abs_nav_difference"], 0)
+            candidate = Path(payload["candidate_directory"])
+            with (candidate / "corporate_actions.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                actions = list(csv.DictReader(handle))
+            self.assertEqual(
+                [row["accounting_event_type"] for row in actions],
+                ["split", "reverse_split"],
+            )
+            self.assertGreater(int(actions[0]["quantity_delta"]), 0)
+            self.assertLess(int(actions[1]["quantity_delta"]), 0)
+
+    def test_cross_action_intent_is_rejected_before_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            fixture = build_curated_reference(
+                temporary,
+                adjustment="none",
+                corporate_action_rows=[
+                    {
+                        "symbol": "510300.XSHG",
+                        "event_type": "split",
+                        "ex_date": "2025-01-03",
+                        "announced_at": "2025-01-02T09:00:00+08:00",
+                        "cash_amount": "",
+                        "ratio": "2",
+                        "available_at": "2025-01-02T09:00:00+08:00",
+                    }
+                ],
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "validate-rqalpha",
+                        "--reference-run",
+                        str(fixture["reference"]),
+                        "--dataset",
+                        str(fixture["dataset"]),
+                        "--output-root",
+                        str(temporary / "candidate"),
+                    ]
+                )
+            payload = json.loads(stdout.getvalue())
+
+            self.assertEqual(exit_code, 0, payload)
+            self.assertEqual(payload["status"], "pass")
+            self.assertEqual(
+                payload["summary"]["order_lifecycle"]["rejected_order_count"],
+                1,
+            )
+            candidate = Path(payload["candidate_directory"])
+            trades = (candidate / "trades.csv").read_text(encoding="utf-8")
+            events = (candidate / "events.csv").read_text(encoding="utf-8")
+            self.assertIn("rejected_corporate_action", trades)
+            self.assertIn("order_corporate_action_reject", events)
 
     def test_zero_affordable_quantity_is_a_native_rejection(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

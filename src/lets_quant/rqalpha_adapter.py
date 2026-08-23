@@ -26,17 +26,16 @@ from .engine_inputs import (
     EngineBar,
     load_frozen_order_intents,
     load_json_object,
-    reject_unsupported_unadjusted_actions,
     resolve_engine_market_input,
 )
 from .independent_policy import (
     IndependentPolicyError,
     independent_signal,
 )
-from .models import Policy
+from .models import CorporateAction, Policy
 
 
-ADAPTER_VERSION = "3"
+ADAPTER_VERSION = "4"
 SUPPORTED_RQALPHA_VERSION = "6.3.0"
 CHINA_TIMEZONE = timezone(timedelta(hours=8))
 DECISION_MODES = {"independent_policy", "frozen_orders"}
@@ -53,6 +52,8 @@ class _RuntimeContext:
     market_prices: Dict[str, Dict[str, float]]
     market_bars: Dict[str, Dict[str, EngineBar]]
     tradable_by_date: Dict[str, Dict[str, bool]]
+    corporate_actions_by_date: Dict[str, List[CorporateAction]]
+    price_adjustment: str
     volumes: Dict[str, Dict[str, int]]
     lot_size: int
     cash_buffer_weight: float
@@ -65,6 +66,7 @@ class _RuntimeContext:
     signals: List[Dict[str, Any]] = field(default_factory=list)
     events: List[Dict[str, Any]] = field(default_factory=list)
     nav_rows: List[Dict[str, Any]] = field(default_factory=list)
+    corporate_action_rows: List[Dict[str, Any]] = field(default_factory=list)
     peak_nav: float = 0.0
     risk_frozen: bool = False
     submitting_intent: Optional[Dict[str, Any]] = None
@@ -333,13 +335,80 @@ class _FrozenDailyDataSource:
         del start_date, end_date, tenor
         return self._pd.DataFrame()
 
-    def get_dividend(self, instrument: Any) -> None:
-        del instrument
-        return None
+    def get_dividend(self, instrument: Any) -> Any:
+        if self._runtime.price_adjustment != "none":
+            return None
+        original = self._runtime.original_symbols.get(instrument.order_book_id)
+        if original is None:
+            return None
+        actions = sorted(
+            (
+                action
+                for day_actions in self._runtime.corporate_actions_by_date.values()
+                for action in day_actions
+                if action.symbol == original
+                and action.event_type == "cash_dividend"
+            ),
+            key=lambda action: action.ex_date,
+        )
+        if not actions:
+            return None
+        dtype = [
+            ("book_closure_date", "i8"),
+            ("announcement_date", "i8"),
+            ("dividend_cash_before_tax", "f8"),
+            ("ex_dividend_date", "i8"),
+            ("payable_date", "i8"),
+            ("round_lot", "f8"),
+        ]
+        rows = []
+        for action in actions:
+            ex_date = int(action.ex_date.strftime("%Y%m%d"))
+            announcement_date = (
+                action.announced_at.date()
+                if action.announced_at is not None
+                else action.ex_date
+            )
+            rows.append(
+                (
+                    ex_date,
+                    int(announcement_date.strftime("%Y%m%d")),
+                    float(action.cash_amount),
+                    ex_date,
+                    ex_date,
+                    1.0,
+                )
+            )
+        return self._np.array(rows, dtype=dtype)
 
-    def get_split(self, instrument: Any) -> None:
-        del instrument
-        return None
+    def get_split(self, instrument: Any) -> Any:
+        if self._runtime.price_adjustment != "none":
+            return None
+        original = self._runtime.original_symbols.get(instrument.order_book_id)
+        if original is None:
+            return None
+        actions = sorted(
+            (
+                action
+                for day_actions in self._runtime.corporate_actions_by_date.values()
+                for action in day_actions
+                if action.symbol == original
+                and action.event_type in {"split", "reverse_split"}
+            ),
+            key=lambda action: action.ex_date,
+        )
+        if not actions:
+            return None
+        return self._np.array(
+            [
+                (
+                    int(action.ex_date.strftime("%Y%m%d")) * 1_000_000,
+                    float(action.ratio),
+                )
+                for action in actions
+            ],
+            dtype=[("ex_date", "i8"), ("split_factor", "f8")],
+        )
 
     def get_settle_price(self, instrument: Any, trading_date: Any) -> float:
         del instrument, trading_date
@@ -428,6 +497,11 @@ class _LetsQuantRqalphaMod:
             )
         env.event_bus.add_listener(
             EVENT.POST_SETTLEMENT, self._capture_nav, user=True
+        )
+        env.event_bus.add_listener(
+            EVENT.POST_BEFORE_TRADING,
+            self._capture_corporate_actions,
+            user=True,
         )
 
     def _event_listener(self, event_type: str) -> Any:
@@ -532,6 +606,100 @@ class _LetsQuantRqalphaMod:
             }
         )
 
+    def _capture_corporate_actions(self, event: Any) -> None:
+        del event
+        if self._runtime is None or self._env is None:
+            raise RuntimeError("RQAlpha collector is not initialized")
+        trading_date = self._env.trading_dt.date().isoformat()
+        previous_positions = (
+            dict(self._runtime.nav_rows[-1]["positions"])
+            if self._runtime.nav_rows
+            else {symbol: 0 for symbol in self._runtime.symbols}
+        )
+        previous_cash = (
+            float(self._runtime.nav_rows[-1]["cash"])
+            if self._runtime.nav_rows
+            else float(self._runtime.policy.portfolio.initial_cash)
+        )
+        actual_positions = {symbol: 0 for symbol in self._runtime.symbols}
+        for position in self._env.portfolio.get_positions():
+            quantity = int(position.quantity)
+            if quantity == 0:
+                continue
+            symbol = self._runtime.original_symbols.get(
+                str(position.order_book_id)
+            )
+            if symbol is None:
+                raise RuntimeError(
+                    f"unexpected RQAlpha position {position.order_book_id}"
+                )
+            actual_positions[symbol] += quantity
+
+        expected_positions = dict(previous_positions)
+        expected_cash = previous_cash
+        action_rows: List[Dict[str, Any]] = []
+        for action in sorted(
+            self._runtime.corporate_actions_by_date.get(trading_date, []),
+            key=lambda item: (item.symbol, item.event_type),
+        ):
+            quantity_before = expected_positions.get(action.symbol, 0)
+            quantity_after = quantity_before
+            cash_delta = 0.0
+            accounting_event_type = "corporate_action_embedded"
+            if self._runtime.price_adjustment == "none":
+                accounting_event_type = action.event_type
+                if action.event_type == "cash_dividend":
+                    if action.cash_amount is None:
+                        raise RuntimeError(
+                            "RQAlpha cash dividend is missing cash_amount"
+                        )
+                    cash_delta = quantity_before * float(action.cash_amount)
+                    expected_cash += cash_delta
+                else:
+                    if action.ratio is None:
+                        raise RuntimeError(
+                            "RQAlpha split action is missing ratio"
+                        )
+                    raw_quantity = quantity_before * float(action.ratio)
+                    quantity_after = round(raw_quantity)
+                    if abs(raw_quantity - quantity_after) > 1e-9:
+                        raise RuntimeError(
+                            "RQAlpha corporate action creates fractional shares "
+                            f"without a cash-in-lieu policy: {action.symbol}"
+                        )
+                    if action.symbol in expected_positions:
+                        expected_positions[action.symbol] = int(quantity_after)
+            action_rows.append(
+                {
+                    "trading_date": trading_date,
+                    "symbol": action.symbol,
+                    "source_event_type": action.event_type,
+                    "accounting_event_type": accounting_event_type,
+                    "quantity_delta": int(quantity_after - quantity_before),
+                    "cash_delta": cash_delta,
+                    "cash_amount": action.cash_amount,
+                    "ratio": action.ratio,
+                    "reference_id": (
+                        f"corporate_action:{trading_date}:{action.symbol}:"
+                        f"{action.event_type}"
+                    ),
+                }
+            )
+        actual_cash = float(self._env.portfolio.cash)
+        if actual_positions != expected_positions:
+            raise RuntimeError(
+                "RQAlpha native corporate-action position state differs from "
+                f"the frozen input on {trading_date}: expected "
+                f"{expected_positions}, got {actual_positions}"
+            )
+        if abs(actual_cash - expected_cash) > 1e-7:
+            raise RuntimeError(
+                "RQAlpha native corporate-action cash state differs from the "
+                f"frozen input on {trading_date}: expected {expected_cash}, "
+                f"got {actual_cash}"
+            )
+        self._runtime.corporate_action_rows.extend(action_rows)
+
     def tear_down(self, code: Any, exception: Any = None) -> Dict[str, Any]:
         del code, exception
         if self._runtime is None:
@@ -539,6 +707,9 @@ class _LetsQuantRqalphaMod:
         return {
             "events": list(self._runtime.events),
             "nav_rows": list(self._runtime.nav_rows),
+            "corporate_action_rows": list(
+                self._runtime.corporate_action_rows
+            ),
         }
 
 
@@ -663,6 +834,53 @@ def _submit_intent(
         runtime.submitting_intent = None
 
 
+def _crosses_quantity_changing_action(
+    runtime: _RuntimeContext, intent: Mapping[str, Any]
+) -> bool:
+    if runtime.price_adjustment != "none":
+        return False
+    return any(
+        action.symbol == intent["symbol"]
+        and action.event_type in {"split", "reverse_split"}
+        and intent["signal_date"]
+        < action.ex_date.isoformat()
+        <= intent["execution_date"]
+        for actions in runtime.corporate_actions_by_date.values()
+        for action in actions
+    )
+
+
+def _record_corporate_action_rejection(
+    context: Any,
+    runtime: _RuntimeContext,
+    intent: Mapping[str, Any],
+) -> None:
+    runtime.events.append(
+        {
+            "sequence": len(runtime.events) + 1,
+            "event_time": _event_time(context.now),
+            "event_type": "order_corporate_action_reject",
+            "order_id": (
+                "rqalpha-corporate-action-"
+                f"{int(intent['sequence']) + 1}"
+            ),
+            "trade_id": "",
+            "symbol": intent["symbol"],
+            "side": intent["side"],
+            "requested_quantity": int(intent["quantity"]),
+            "cumulative_filled_quantity": 0,
+            "event_fill_quantity": 0,
+            "order_status": "REJECTED",
+            "fill_price": 0.0,
+            "commission": 0.0,
+            "tax": 0.0,
+            "message": (
+                "intent quantity became stale across a split or reverse split"
+            ),
+        }
+    )
+
+
 def _strategy_handle_bar(context: Any, bar_dict: Any) -> None:
     runtime = _RUNTIMES[context.lets_quant_runtime_id]
     trading_date = context.now.date().isoformat()
@@ -680,7 +898,10 @@ def _strategy_handle_bar(context: Any, bar_dict: Any) -> None:
         due_intents,
         key=lambda item: (0 if item["side"] == "SELL" else 1, item["sequence"]),
     ):
-        _submit_intent(context, runtime, intent)
+        if _crosses_quantity_changing_action(runtime, intent):
+            _record_corporate_action_rejection(context, runtime, intent)
+        else:
+            _submit_intent(context, runtime, intent)
 
     if runtime.decision_mode == "frozen_orders":
         return
@@ -803,13 +1024,16 @@ def _normalize_engine_results(
         market_price = runtime.market_prices[intent["execution_date"]][
             intent["symbol"]
         ]
+        is_corporate_action_reject = (
+            events[0]["event_type"] == "order_corporate_action_reject"
+        )
         is_non_tradable = not runtime.tradable_by_date[
             intent["execution_date"]
         ][intent["symbol"]]
         if filled_quantity == 0:
             fill_price = (
                 market_price
-                if is_non_tradable
+                if is_non_tradable or is_corporate_action_reject
                 else market_price
                 * (
                     1.0 + runtime.slippage_fraction
@@ -822,7 +1046,9 @@ def _normalize_engine_results(
             fill_price = avg_fill_price
             slippage = abs(fill_price - market_price) * filled_quantity
         status = (
-            "rejected_not_tradable"
+            "rejected_corporate_action"
+            if filled_quantity == 0 and is_corporate_action_reject
+            else "rejected_not_tradable"
             if filled_quantity == 0 and is_non_tradable
             else "filled"
             if final_status == "FILLED"
@@ -863,10 +1089,10 @@ def _normalize_engine_results(
             date_order[
                 trade_rows_by_sequence[sequence]["execution_date"]
             ],
-            0
-            if trade_rows_by_sequence[sequence]["status"]
-            == "rejected_not_tradable"
-            else 1,
+            {
+                "rejected_corporate_action": 0,
+                "rejected_not_tradable": 1,
+            }.get(trade_rows_by_sequence[sequence]["status"], 2),
             sequence,
         ),
     )
@@ -923,10 +1149,7 @@ def run_rqalpha_validation(
         reference_directory,
         supplied_prices_path=prices_path,
         supplied_dataset_path=dataset_path,
-        adapter_name="RQAlpha adapter v3",
-    )
-    reject_unsupported_unadjusted_actions(
-        market_input, adapter_name="RQAlpha adapter v3"
+        adapter_name="RQAlpha adapter v4",
     )
     reference_metrics = load_json_object(
         reference_directory / "metrics.json"
@@ -952,7 +1175,7 @@ def run_rqalpha_validation(
         )
     if any(reference_nav[0]["positions"].values()):
         raise EngineValidationError(
-            "RQAlpha adapter v3 supports zero starting positions only"
+            "RQAlpha adapter v4 supports zero starting positions only"
         )
     market_prices = {
         trading_date.isoformat(): {
@@ -973,7 +1196,7 @@ def run_rqalpha_validation(
             symbols=symbols,
             trading_dates=trading_dates,
             market_prices=market_prices,
-            adapter_name="RQAlpha adapter v3 frozen-orders mode",
+            adapter_name="RQAlpha adapter v4 frozen-orders mode",
         )
     else:
         intents = []
@@ -1019,6 +1242,13 @@ def run_rqalpha_validation(
             }
             for trading_date in trading_dates
         },
+        corporate_actions_by_date={
+            trading_date: market.corporate_actions_on(
+                date.fromisoformat(trading_date)
+            )
+            for trading_date in trading_dates
+        },
+        price_adjustment=market.price_adjustment,
         volumes=volumes,
         lot_size=policy.execution.lot_size,
         cash_buffer_weight=policy.portfolio.cash_buffer_weight,
@@ -1112,7 +1342,9 @@ def run_rqalpha_validation(
             "RQAlpha NAV date axis differs from the frozen reference"
         )
     order_rows, trade_rows = _normalize_engine_results(runtime)
-    metrics = summarize_candidate(runtime.nav_rows, trade_rows)
+    metrics = summarize_candidate(
+        runtime.nav_rows, trade_rows, runtime.corporate_action_rows
+    )
     market_scope: Dict[str, Any] = {
         "reference_data_source": market_input.source_type,
         "prices_sha256": file_sha256(market_input.prices_path),
@@ -1153,6 +1385,7 @@ def run_rqalpha_validation(
         },
         nav_rows=runtime.nav_rows,
         trade_rows=trade_rows,
+        corporate_action_rows=runtime.corporate_action_rows,
         metrics=metrics,
         order_rows=order_rows,
         event_rows=runtime.events,
@@ -1174,6 +1407,8 @@ def run_rqalpha_validation(
                     else ["frozen order-intent replay"]
                 ),
                 "RQAlpha native order, trade, cancellation, and rejection events",
+                "RQAlpha native cash-dividend and split account transitions",
+                "corporate-action event journal and stale-intent rejection",
                 "event-to-order-to-normalized-trade lifecycle reconciliation",
                 "daily cash, positions, NAV, costs, and core summary metrics",
             ],
@@ -1184,6 +1419,7 @@ def run_rqalpha_validation(
                 "insufficient-cash partial fills and unfilled market-order "
                 "cancellation",
                 "commission, sell tax, slippage, positions, cash, and valuation",
+                "cash-dividend credits and integral split position changes",
             ],
             "adapter_mapped_components": [
                 "synthetic RQAlpha instrument identifiers",
@@ -1192,10 +1428,10 @@ def run_rqalpha_validation(
                 "dynamic cash-buffer withdrawal and immediate redeposit",
                 "standalone closes mapped to flat OHLC or curated OHLCV bars",
                 "curated suspension state mapped to RQAlpha tradability checks",
+                "cross-action pending intent invalidation before submission",
             ],
             "excluded_components": [
                 "market data correctness and provider lineage",
-                "unadjusted corporate-action accounting",
                 "correctness of adjusted-price factors",
                 "real order books, queue priority, and intraday execution",
             ],
@@ -1208,11 +1444,12 @@ def run_rqalpha_validation(
         limitations=[
             "Parity validates software behavior for this frozen input only; it "
             "does not establish strategy or investment validity.",
-            "Adapter v3 accepts standalone prices or validated curated daily "
+            "Adapter v4 accepts standalone prices or validated curated daily "
             "datasets, long-only runs with zero starting positions, and at "
             "most one order per symbol/date.",
-            "Adjusted datasets treat declared corporate actions as embedded in "
-            "prices; unadjusted datasets with actions fail closed.",
+            "Adjusted datasets keep declared actions informational; unadjusted "
+            "cash dividends and integral split results use RQAlpha's native "
+            "account model.",
             (
                 "Independent-policy mode reimplements fixed-weight and momentum "
                 "policy semantics without reading reference signals or trades."

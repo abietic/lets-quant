@@ -1,12 +1,12 @@
 import json
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 from lets_quant.cross_engine import EngineValidationError
 from lets_quant.engine_inputs import (
     load_frozen_order_intents,
-    reject_unsupported_unadjusted_actions,
     resolve_engine_market_input,
 )
 
@@ -48,7 +48,7 @@ class EngineInputsTest(unittest.TestCase):
                     adapter_name="test adapter",
                 )
 
-    def test_unadjusted_corporate_actions_fail_closed(self) -> None:
+    def test_unadjusted_corporate_actions_are_preserved_for_adapters(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture = build_curated_reference(
                 Path(temp_dir), adjustment="none"
@@ -60,12 +60,13 @@ class EngineInputsTest(unittest.TestCase):
                 adapter_name="test adapter",
             )
 
-            with self.assertRaisesRegex(
-                EngineValidationError, "corporate-action accounting"
-            ):
-                reject_unsupported_unadjusted_actions(
-                    market_input, adapter_name="test adapter"
-                )
+            self.assertEqual(market_input.market.price_adjustment, "none")
+            actions = market_input.market.corporate_actions_by_date
+            self.assertEqual(set(actions or {}), {date(2025, 1, 7)})
+            action = actions[date(2025, 1, 7)][0]
+            self.assertEqual(action.symbol, "511010.XSHG")
+            self.assertEqual(action.event_type, "cash_dividend")
+            self.assertEqual(action.cash_amount, 0.05)
 
     def test_curated_reference_rejects_another_valid_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -332,21 +332,6 @@ def resolve_engine_market_input(
     )
 
 
-def reject_unsupported_unadjusted_actions(
-    market_input: EngineMarketInput, *, adapter_name: str
-) -> None:
-    market = market_input.market
-    action_count = sum(
-        len(actions)
-        for actions in (market.corporate_actions_by_date or {}).values()
-    )
-    if market.price_adjustment == "none" and action_count:
-        raise EngineValidationError(
-            f"{adapter_name} does not yet reproduce explicit unadjusted "
-            "corporate-action accounting"
-        )
-
-
 def _positive_int(value: Any, location: str) -> int:
     if isinstance(value, bool):
         raise EngineValidationError(f"{location} must be a positive integer")

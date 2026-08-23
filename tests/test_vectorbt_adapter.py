@@ -155,6 +155,111 @@ class VectorbtAdapterTest(unittest.TestCase):
                 scope["tradability_source"], "curated_observations"
             )
 
+    def test_unadjusted_actions_reconcile_callback_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            fixture = build_curated_reference(
+                temporary,
+                adjustment="none",
+                corporate_action_rows=[
+                    {
+                        "symbol": "510300.XSHG",
+                        "event_type": "split",
+                        "ex_date": "2025-01-06",
+                        "announced_at": "2025-01-02T09:00:00+08:00",
+                        "cash_amount": "",
+                        "ratio": "2",
+                        "available_at": "2025-01-02T09:00:00+08:00",
+                    },
+                    {
+                        "symbol": "510300.XSHG",
+                        "event_type": "reverse_split",
+                        "ex_date": "2025-01-07",
+                        "announced_at": "2025-01-02T09:00:00+08:00",
+                        "cash_amount": "",
+                        "ratio": "0.5",
+                        "available_at": "2025-01-02T09:00:00+08:00",
+                    },
+                    {
+                        "symbol": "511010.XSHG",
+                        "event_type": "cash_dividend",
+                        "ex_date": "2025-01-08",
+                        "announced_at": "2025-01-02T09:00:00+08:00",
+                        "cash_amount": "0.05",
+                        "ratio": "",
+                        "available_at": "2025-01-02T09:00:00+08:00",
+                    },
+                ],
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "validate-vectorbt",
+                        "--reference-run",
+                        str(fixture["reference"]),
+                        "--dataset",
+                        str(fixture["dataset"]),
+                        "--output-root",
+                        str(temporary / "candidate"),
+                    ]
+                )
+            payload = json.loads(stdout.getvalue())
+
+            self.assertEqual(exit_code, 0, payload)
+            self.assertEqual(payload["status"], "pass")
+            self.assertEqual(payload["summary"]["max_abs_nav_difference"], 0)
+            self.assertEqual(payload["summary"]["max_abs_cash_difference"], 0)
+            candidate = Path(payload["candidate_directory"])
+            with (candidate / "corporate_actions.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                actions = list(csv.DictReader(handle))
+            self.assertEqual(
+                [row["accounting_event_type"] for row in actions],
+                ["split", "reverse_split", "cash_dividend"],
+            )
+            self.assertEqual(actions[-1]["cash_delta"], "10.00000000")
+
+    def test_cross_action_intent_is_rejected_before_vectorbt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            fixture = build_curated_reference(
+                temporary,
+                adjustment="none",
+                corporate_action_rows=[
+                    {
+                        "symbol": "510300.XSHG",
+                        "event_type": "split",
+                        "ex_date": "2025-01-03",
+                        "announced_at": "2025-01-02T09:00:00+08:00",
+                        "cash_amount": "",
+                        "ratio": "2",
+                        "available_at": "2025-01-02T09:00:00+08:00",
+                    }
+                ],
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "validate-vectorbt",
+                        "--reference-run",
+                        str(fixture["reference"]),
+                        "--dataset",
+                        str(fixture["dataset"]),
+                        "--output-root",
+                        str(temporary / "candidate"),
+                    ]
+                )
+            payload = json.loads(stdout.getvalue())
+
+            self.assertEqual(exit_code, 0, payload)
+            self.assertEqual(payload["status"], "pass")
+            candidate = Path(payload["candidate_directory"])
+            trades = (candidate / "trades.csv").read_text(encoding="utf-8")
+            self.assertIn("rejected_corporate_action", trades)
+
 
 if __name__ == "__main__":
     unittest.main()

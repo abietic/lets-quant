@@ -3,7 +3,7 @@ import csv
 import io
 import json
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from lets_quant.cli import main
 
@@ -27,6 +27,7 @@ def build_curated_reference(
     suspended_symbol: Optional[str] = None,
     suspension_date: str = "2025-01-03",
     include_corporate_action: bool = True,
+    corporate_action_rows: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Path]:
     temporary.mkdir(parents=True, exist_ok=True)
     bars_path = temporary / "bars.csv"
@@ -65,14 +66,29 @@ def build_curated_reference(
         encoding="utf-8",
     )
     corporate_actions_path = temporary / "corporate-actions.csv"
-    if include_corporate_action:
+    action_fields = [
+        "symbol",
+        "event_type",
+        "ex_date",
+        "announced_at",
+        "cash_amount",
+        "ratio",
+        "available_at",
+    ]
+    if corporate_action_rows is not None:
+        with corporate_actions_path.open(
+            "w", newline="", encoding="utf-8"
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=action_fields)
+            writer.writeheader()
+            writer.writerows(corporate_action_rows)
+    elif include_corporate_action:
         corporate_actions_path.write_bytes(
             (ROOT / "examples/m1/corporate_actions.csv").read_bytes()
         )
     else:
         corporate_actions_path.write_text(
-            "symbol,event_type,ex_date,announced_at,cash_amount,ratio,"
-            "available_at\n",
+            ",".join(action_fields) + "\n",
             encoding="utf-8",
         )
 

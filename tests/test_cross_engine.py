@@ -19,6 +19,8 @@ from lets_quant.cross_engine import (
     write_engine_candidate,
 )
 
+from tests.engine_helpers import build_curated_reference
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -61,6 +63,51 @@ class CrossEngineTest(unittest.TestCase):
             validation_scope={
                 "input": "frozen_order_intents",
                 "validated_components": ["fixture normalization"],
+                "excluded_components": ["strategy validity"],
+            },
+            limitations=["test fixture only"],
+        )
+
+    def _corporate_action_candidate_run(
+        self,
+        temporary: Path,
+        reference: Path,
+        *,
+        cash_delta: float = 10.0,
+    ) -> Path:
+        nav_rows = read_nav_rows(reference / "nav.csv")
+        trade_rows = read_trade_rows(reference / "trades.csv")
+        action_rows = [
+            {
+                "trading_date": "2025-01-07",
+                "symbol": "511010.XSHG",
+                "source_event_type": "cash_dividend",
+                "accounting_event_type": "cash_dividend",
+                "quantity_delta": 0,
+                "cash_delta": cash_delta,
+                "cash_amount": 0.05,
+                "ratio": None,
+                "reference_id": (
+                    "corporate_action:2025-01-07:"
+                    "511010.XSHG:cash_dividend"
+                ),
+            }
+        ]
+        return write_engine_candidate(
+            reference_directory=reference,
+            output_root=temporary / "action-candidates",
+            engine={
+                "name": "test-action-engine",
+                "version": "1.0",
+                "adapter_version": "1",
+            },
+            nav_rows=nav_rows,
+            trade_rows=trade_rows,
+            corporate_action_rows=action_rows,
+            metrics=summarize_candidate(nav_rows, trade_rows, action_rows),
+            validation_scope={
+                "input": "frozen_order_intents",
+                "validated_components": ["corporate action accounting"],
                 "excluded_components": ["strategy validity"],
             },
             limitations=["test fixture only"],
@@ -387,6 +434,93 @@ class CrossEngineTest(unittest.TestCase):
                 checks["candidate_file_integrity"]["status"], "blocked"
             )
             self.assertEqual(checks["nav_and_cash"]["status"], "blocked")
+
+    def test_reference_corporate_actions_require_candidate_evidence(self) -> None:
+        for adjustment in ("none", "hfq"):
+            with self.subTest(adjustment=adjustment):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temporary = Path(temp_dir)
+                    fixture = build_curated_reference(
+                        temporary / "fixture", adjustment=adjustment
+                    )
+                    candidate = self._candidate_run(
+                        temporary, fixture["reference"]
+                    )
+
+                    report = reconcile_engine_candidate(
+                        fixture["reference"], candidate
+                    )
+
+                    checks = {
+                        check["name"]: check for check in report["checks"]
+                    }
+                    self.assertEqual(report["status"], "blocked")
+                    self.assertEqual(
+                        checks["candidate_file_integrity"]["status"],
+                        "blocked",
+                    )
+                    mismatches = checks["candidate_file_integrity"][
+                        "details"
+                    ]["mismatches"]
+                    self.assertTrue(
+                        any(
+                            item["field"] == "corporate_actions.csv"
+                            for item in mismatches
+                        )
+                    )
+
+    def test_explicit_corporate_action_evidence_reconciles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            fixture = build_curated_reference(
+                temporary / "fixture", adjustment="none"
+            )
+            candidate = self._corporate_action_candidate_run(
+                temporary, fixture["reference"]
+            )
+
+            report = reconcile_engine_candidate(
+                fixture["reference"], candidate
+            )
+
+            checks = {check["name"]: check for check in report["checks"]}
+            self.assertEqual(report["status"], "pass")
+            self.assertEqual(checks["corporate_actions"]["status"], "pass")
+            summary = report["summary"]["corporate_actions"]
+            self.assertTrue(summary["present"])
+            self.assertEqual(summary["reference_explicit_action_count"], 1)
+            self.assertEqual(summary["candidate_explicit_action_count"], 1)
+
+    def test_hash_consistent_corporate_action_drift_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir)
+            fixture = build_curated_reference(
+                temporary / "fixture", adjustment="none"
+            )
+            candidate = self._corporate_action_candidate_run(
+                temporary, fixture["reference"]
+            )
+            actions_path = candidate / "corporate_actions.csv"
+            actions_path.write_text(
+                actions_path.read_text(encoding="utf-8").replace(
+                    "10.00000000", "11.00000000", 1
+                ),
+                encoding="utf-8",
+            )
+            self._refresh_candidate_identity(
+                candidate, "corporate_actions.csv"
+            )
+
+            report = reconcile_engine_candidate(
+                fixture["reference"], candidate
+            )
+
+            checks = {check["name"]: check for check in report["checks"]}
+            self.assertEqual(report["status"], "blocked")
+            self.assertEqual(
+                checks["candidate_file_integrity"]["status"], "pass"
+            )
+            self.assertEqual(checks["corporate_actions"]["status"], "blocked")
 
     def test_hash_consistent_result_drift_is_still_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

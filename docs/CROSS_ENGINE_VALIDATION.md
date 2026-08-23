@@ -9,8 +9,8 @@
 
 | 引擎 | 主要独立证据 | 仍由适配层映射 |
 |---|---|---|
-| VectorBT 1.1.0 | 订单记录、共享现金、持仓和组合价值 | 停牌拒绝、卖出顺序、现金缓冲、整手数量和费用拆分 |
-| RQAlpha 6.3.0 | 独立固定权重/动量 PIT 决策，清洗 OHLCV、原生停牌前置拒绝、撮合、费用、账户和 NAV | 目标整手与换手率规则、合成证券代码、动态现金缓冲 |
+| VectorBT 1.1.0 | 订单记录、共享现金、持仓和组合价值 | 停牌拒绝、企业行动回调、卖出顺序、现金缓冲、整手数量和费用拆分 |
+| RQAlpha 6.3.0 | 独立固定权重/动量 PIT 决策，清洗 OHLCV、原生停牌/分红/拆并股、撮合、费用、账户和 NAV | 目标整手与换手率规则、合成证券代码、动态现金缓冲、跨行动订单拒绝 |
 
 两条链路都只验证 manifest 明确声明的范围。RQAlpha 的独立实现可以发现固定
 权重和动量策略的 PIT 决策、目标整手及风险门禁漂移，但不能证明市场数据正确、
@@ -100,8 +100,8 @@ make rqalpha-test rqalpha-demo
 ```
 
 价格或数据集 SHA-256 必须与参考 manifest 一致。参考 manifest 还必须包含
-v0.7.0 引入的 `file_sha256` 映射。v0.10.0 的候选和报告 schema 已升级为 v4；
-旧候选必须重新生成，不能降级绕过。
+v0.7.0 引入的 `file_sha256` 映射。v0.11.0 的候选和报告 schema 已升级为 v5，
+并把参考 `ledger.csv` 哈希纳入绑定；旧候选必须重新生成，不能降级绕过。
 
 ## RQAlpha 流动性压力
 
@@ -124,7 +124,7 @@ PYTHONPATH=src python -m lets_quant validate-rqalpha \
 
 ## 候选契约
 
-候选 schema v4 的基础产物为：
+候选 schema v5 的基础产物为：
 
 - `manifest.json`：引擎版本、参考指纹、候选哈希、验证范围和限制。
 - `nav.csv`：逐日 NAV、现金和持仓。
@@ -132,12 +132,22 @@ PYTHONPATH=src python -m lets_quant validate-rqalpha \
 - `metrics.json`：共同可比的核心指标。
 - `reconciliation.json`：绑定、完整性、结果差异和报告 SHA-256。
 
+参考 `ledger.csv` 含任意企业行动时，候选必须写入：
+
+- `corporate_actions.csv`：交易日、标的、来源事件、实际会计处理、现金/数量变化、
+  每股分红或拆并比例，以及与参考账本一致的稳定 reference ID。
+
+复权数据的事件必须标记为 `corporate_action_embedded` 且现金/数量变化为零；未
+复权数据必须明确记录 `cash_dividend`、`split` 或 `reverse_split`。文件缺失、
+顺序漂移、重复事件、类型与参数矛盾或逐事件结果不同都会阻断对账。
+
 事件驱动引擎还必须写入：
 
 - `orders.csv`：每个原生订单的请求量、成交量、均价、费用和最终状态。
 - `events.csv`：带全局顺序和时区的受理、活动、成交、撤单或拒单事件；引擎在
   创建订单对象前拒绝时，使用单事件的 `order_precheck_reject`，明确由停牌触发
-  时使用 `order_tradability_reject`。
+  时使用 `order_tradability_reject`；冻结订单跨越未复权拆并股时使用
+  `order_corporate_action_reject`。
 
 声明 `validation_scope.input=independent_policy` 的候选还必须写入：
 
@@ -172,6 +182,8 @@ ID 格式和订单结构。`accepted` 必须包含订单，`no_action` 不能包
 | 收益、回撤和换手率 | 绝对误差不超过 `1e-10` |
 | 策略状态、decision ID、证据、诊断和拟议订单 | 语义字段完全一致，换手率按 ratio 容差 |
 | 生命周期顺序、数量和终态 | 规范化状态机完全一致 |
+| 企业行动日期、类型、数量变化和 reference ID | 完全一致 |
+| 分红现金、每股金额和拆并比例 | 分别按 money/ratio 容差 |
 
 任一检查失败，报告状态为 `blocked`，命令返回退出码 `3`。输入、哈希或引擎
 能力不受支持时返回退出码 `2`。
@@ -187,15 +199,22 @@ PYTHONPATH=src python -m lets_quant reconcile-engine \
 
 ## 当前限制
 
-VectorBT adapter v2 与 RQAlpha adapter v3 接受 `standalone_prices_csv` 或质量
+VectorBT adapter v3 与 RQAlpha adapter v4 接受 `standalone_prices_csv` 或质量
 通过且身份与参考快照一致的 `curated_dataset`，仍限日线、只做多、零初始持仓，
 且同标的同执行日最多一笔订单。VectorBT 的停牌拒绝属于显式 adapter lowering；
 RQAlpha 使用清洗 OHLCV、实际成交量和原生交易状态检查。两者都将 `qfq/hfq`
-公司行动视为已嵌入价格；`adjustment=none` 且存在公司行动时直接拒绝，因为独立
-现金分红和拆并股会计尚未实现。
+公司行动视为已嵌入价格。`adjustment=none` 时，VectorBT 通过 pre-segment 回调
+在同日订单前改变现金/持仓；RQAlpha 通过 DataSource 的原生分红和拆并股接口
+改变账户，随后由适配器读取真实状态并与冻结输入推导值核对。
+
+当前只支持税前每股现金分红和产生整股结果的拆并股。为与参考日线语义一致，
+RQAlpha 的到账日被规范为除权日；红利税、实际到账延迟、碎股现金替代、复杂
+行动顺序和代码变更仍会失败关闭或尚未建模。冻结订单跨越拆并股时两个适配器
+都会在提交前拒绝，不猜测柜台改单规则。
 
 RQAlpha 默认通过独立模块复算当前支持的固定权重和动量策略，不导入参考
 `strategies.py`、`risk.py` 或 `backtest.py`；旧的 `frozen_orders` 模式只用于执行
-诊断。目标整手、换手率和现金缓冲仍是适配层规则，VectorBT 的可买数量也仍是
-adapter lowering。下一阶段需要独立实现未复权公司行动、非零初始持仓和证券
-主数据映射，并用真实且有使用权的数据做容量复核。
+诊断。目标整手、换手率和现金缓冲仍是适配层规则，VectorBT 的可买数量及企业
+行动状态变化也仍是 adapter lowering。下一阶段需要支持非零初始持仓和真实证券
+主数据映射，为需要拟合的模型实现逐折训练，并用真实且有使用权的数据做容量
+复核。

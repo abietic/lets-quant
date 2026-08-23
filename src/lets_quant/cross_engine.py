@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 NAV_FIELDS = ["date", "nav", "cash", "positions"]
 TRADE_FIELDS = [
     "signal_date",
@@ -75,9 +75,25 @@ EVENT_FIELDS = [
     "tax",
     "message",
 ]
+CORPORATE_ACTION_FIELDS = [
+    "trading_date",
+    "symbol",
+    "source_event_type",
+    "accounting_event_type",
+    "quantity_delta",
+    "cash_delta",
+    "cash_amount",
+    "ratio",
+    "reference_id",
+]
+CORPORATE_ACTION_TYPES = {"cash_dividend", "split", "reverse_split"}
+CORPORATE_ACTION_ACCOUNTING_TYPES = (
+    CORPORATE_ACTION_TYPES | {"corporate_action_embedded"}
+)
 FINAL_ORDER_STATUSES = {"FILLED", "CANCELLED", "REJECTED"}
 ORDER_STATUSES = FINAL_ORDER_STATUSES | {"PENDING_NEW", "ACTIVE"}
 ORDER_EVENT_TYPES = {
+    "order_corporate_action_reject",
     "order_precheck_reject",
     "order_tradability_reject",
     "order_pending_new",
@@ -96,6 +112,8 @@ METRIC_FIELDS = [
     "total_commission",
     "total_sell_tax",
     "total_slippage_cost",
+    "corporate_action_entry_count",
+    "total_cash_dividends",
     "turnover_ratio",
     "total_return",
     "max_drawdown",
@@ -107,8 +125,13 @@ MONEY_METRICS = {
     "total_commission",
     "total_sell_tax",
     "total_slippage_cost",
+    "total_cash_dividends",
 }
-COUNT_METRICS = {"trading_days", "filled_trade_count"}
+COUNT_METRICS = {
+    "trading_days",
+    "filled_trade_count",
+    "corporate_action_entry_count",
+}
 
 
 class EngineValidationError(ValueError):
@@ -191,6 +214,24 @@ def _non_negative_int(value: Any, location: str) -> int:
     if parsed < 0:
         raise EngineValidationError(f"{location} must be >= 0")
     return parsed
+
+
+def _integer(value: Any, location: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise EngineValidationError(f"{location} must be an integer") from exc
+    if str(parsed) != str(value).strip() and not (
+        isinstance(value, int) and not isinstance(value, bool)
+    ):
+        raise EngineValidationError(f"{location} must be an integer")
+    return parsed
+
+
+def _optional_finite_float(value: Any, location: str) -> Optional[float]:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return _finite_float(value, location)
 
 
 def _parse_positions(value: Any, location: str) -> Dict[str, int]:
@@ -901,6 +942,234 @@ def read_event_rows(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def _validated_corporate_action_row(
+    row: Mapping[str, Any], location: str
+) -> Dict[str, Any]:
+    trading_date = str(row.get("trading_date") or "").strip()
+    try:
+        datetime.strptime(trading_date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise EngineValidationError(
+            f"{location}:trading_date must be YYYY-MM-DD"
+        ) from exc
+    symbol = str(row.get("symbol") or "").strip().upper()
+    source_event_type = str(row.get("source_event_type") or "").strip()
+    accounting_event_type = str(
+        row.get("accounting_event_type") or ""
+    ).strip()
+    reference_id = str(row.get("reference_id") or "").strip()
+    if not symbol:
+        raise EngineValidationError(f"{location}:symbol must not be empty")
+    if source_event_type not in CORPORATE_ACTION_TYPES:
+        raise EngineValidationError(
+            f"{location}:unsupported source_event_type {source_event_type!r}"
+        )
+    if accounting_event_type not in CORPORATE_ACTION_ACCOUNTING_TYPES:
+        raise EngineValidationError(
+            f"{location}:unsupported accounting_event_type "
+            f"{accounting_event_type!r}"
+        )
+    expected_reference_id = (
+        f"corporate_action:{trading_date}:{symbol}:{source_event_type}"
+    )
+    if reference_id != expected_reference_id:
+        raise EngineValidationError(
+            f"{location}:reference_id must be {expected_reference_id}"
+        )
+    quantity_delta = _integer(
+        row.get("quantity_delta"), f"{location}:quantity_delta"
+    )
+    cash_delta = _finite_float(
+        row.get("cash_delta"), f"{location}:cash_delta"
+    )
+    cash_amount = _optional_finite_float(
+        row.get("cash_amount"), f"{location}:cash_amount"
+    )
+    ratio = _optional_finite_float(
+        row.get("ratio"), f"{location}:ratio"
+    )
+    if cash_delta < 0:
+        raise EngineValidationError(f"{location}:cash_delta must be >= 0")
+    if source_event_type == "cash_dividend":
+        if cash_amount is None or cash_amount < 0 or ratio is not None:
+            raise EngineValidationError(
+                f"{location}:cash dividend requires cash_amount >= 0 and no ratio"
+            )
+    elif cash_amount is not None:
+        raise EngineValidationError(
+            f"{location}:split actions cannot declare cash_amount"
+        )
+    elif source_event_type == "split" and (ratio is None or ratio <= 1):
+        raise EngineValidationError(f"{location}:split requires ratio > 1")
+    elif source_event_type == "reverse_split" and (
+        ratio is None or not 0 < ratio < 1
+    ):
+        raise EngineValidationError(
+            f"{location}:reverse_split requires ratio in (0, 1)"
+        )
+    if accounting_event_type == "corporate_action_embedded":
+        if quantity_delta != 0 or cash_delta != 0:
+            raise EngineValidationError(
+                f"{location}:embedded action cannot change cash or quantity"
+            )
+    elif accounting_event_type != source_event_type:
+        raise EngineValidationError(
+            f"{location}:explicit accounting type must match its source event"
+        )
+    elif source_event_type == "cash_dividend" and quantity_delta != 0:
+        raise EngineValidationError(
+            f"{location}:cash dividend cannot change quantity"
+        )
+    elif source_event_type == "split" and quantity_delta < 0:
+        raise EngineValidationError(
+            f"{location}:split quantity_delta must be >= 0"
+        )
+    elif source_event_type == "reverse_split" and quantity_delta > 0:
+        raise EngineValidationError(
+            f"{location}:reverse split quantity_delta must be <= 0"
+        )
+    if source_event_type != "cash_dividend" and cash_delta != 0:
+        raise EngineValidationError(
+            f"{location}:split actions cannot change cash"
+        )
+    return {
+        "trading_date": trading_date,
+        "symbol": symbol,
+        "source_event_type": source_event_type,
+        "accounting_event_type": accounting_event_type,
+        "quantity_delta": quantity_delta,
+        "cash_delta": cash_delta,
+        "cash_amount": cash_amount,
+        "ratio": ratio,
+        "reference_id": reference_id,
+    }
+
+
+def read_corporate_action_rows(path: Path) -> List[Dict[str, Any]]:
+    try:
+        handle = path.open(newline="", encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise EngineValidationError(f"file not found: {path}") from exc
+    rows: List[Dict[str, Any]] = []
+    seen = set()
+    with handle:
+        reader = csv.DictReader(handle)
+        actual = set(reader.fieldnames or [])
+        required = set(CORPORATE_ACTION_FIELDS)
+        if actual != required:
+            raise EngineValidationError(
+                f"{path} must have exactly these columns: "
+                + ", ".join(sorted(required))
+            )
+        for line_number, row in enumerate(reader, start=2):
+            parsed = _validated_corporate_action_row(
+                row, f"{path}:{line_number}"
+            )
+            key = (
+                parsed["trading_date"],
+                parsed["symbol"],
+                parsed["source_event_type"],
+            )
+            if key in seen:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:duplicate corporate action"
+                )
+            seen.add(key)
+            rows.append(parsed)
+    expected_order = sorted(
+        rows,
+        key=lambda item: (
+            item["trading_date"],
+            item["symbol"],
+            item["source_event_type"],
+        ),
+    )
+    if rows != expected_order:
+        raise EngineValidationError(
+            f"{path} corporate actions must use canonical date/symbol/type order"
+        )
+    return rows
+
+
+def _read_reference_corporate_action_rows(path: Path) -> List[Dict[str, Any]]:
+    required_fields = {
+        "entry_id",
+        "sequence",
+        "date",
+        "event_type",
+        "symbol",
+        "quantity_delta",
+        "cash_delta",
+        "expense",
+        "reference_id",
+        "description",
+        "metadata",
+    }
+    try:
+        handle = path.open(newline="", encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise EngineValidationError(f"file not found: {path}") from exc
+    rows: List[Dict[str, Any]] = []
+    with handle:
+        reader = csv.DictReader(handle)
+        if set(reader.fieldnames or []) != required_fields:
+            raise EngineValidationError(
+                f"{path} has an unsupported reference ledger schema"
+            )
+        for line_number, row in enumerate(reader, start=2):
+            accounting_event_type = str(row.get("event_type") or "").strip()
+            if accounting_event_type not in CORPORATE_ACTION_ACCOUNTING_TYPES:
+                continue
+            try:
+                metadata = json.loads(str(row.get("metadata") or ""))
+            except json.JSONDecodeError as exc:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:metadata must be valid JSON"
+                ) from exc
+            if not isinstance(metadata, dict):
+                raise EngineValidationError(
+                    f"{path}:{line_number}:metadata must be an object"
+                )
+            expense = _finite_float(
+                row.get("expense"), f"{path}:{line_number}:expense"
+            )
+            if expense != 0:
+                raise EngineValidationError(
+                    f"{path}:{line_number}:corporate action expense must be zero"
+                )
+            rows.append(
+                _validated_corporate_action_row(
+                    {
+                        "trading_date": row.get("date"),
+                        "symbol": row.get("symbol"),
+                        "source_event_type": metadata.get(
+                            "source_event_type"
+                        ),
+                        "accounting_event_type": accounting_event_type,
+                        "quantity_delta": row.get("quantity_delta"),
+                        "cash_delta": row.get("cash_delta"),
+                        "cash_amount": metadata.get("cash_amount"),
+                        "ratio": metadata.get("ratio"),
+                        "reference_id": row.get("reference_id"),
+                    },
+                    f"{path}:{line_number}",
+                )
+            )
+    expected_order = sorted(
+        rows,
+        key=lambda item: (
+            item["trading_date"],
+            item["symbol"],
+            item["source_event_type"],
+        ),
+    )
+    if rows != expected_order:
+        raise EngineValidationError(
+            f"{path} corporate action ledger order is not canonical"
+        )
+    return rows
+
+
 def reference_identity(reference_directory: Path) -> Dict[str, Any]:
     reference_directory = reference_directory.resolve()
     manifest_path = reference_directory / "manifest.json"
@@ -951,6 +1220,7 @@ def reference_identity(reference_directory: Path) -> Dict[str, Any]:
             )
     required = [
         "policy.snapshot.json",
+        "ledger.csv",
         "metrics.json",
         "nav.csv",
         "signals.csv",
@@ -979,6 +1249,7 @@ def reference_identity(reference_directory: Path) -> Dict[str, Any]:
         "policy_input_sha256": policy_input_hash,
         "prices_input_sha256": prices_input_hash,
         "policy_snapshot_sha256": file_hashes["policy.snapshot.json"],
+        "ledger_sha256": file_hashes["ledger.csv"],
         "metrics_sha256": file_hashes["metrics.json"],
         "nav_sha256": file_hashes["nav.csv"],
         "signals_sha256": file_hashes["signals.csv"],
@@ -991,6 +1262,7 @@ def reference_identity(reference_directory: Path) -> Dict[str, Any]:
 def summarize_candidate(
     nav_rows: Sequence[Mapping[str, Any]],
     trade_rows: Sequence[Mapping[str, Any]],
+    corporate_action_rows: Sequence[Mapping[str, Any]] = (),
 ) -> Dict[str, Any]:
     if not nav_rows:
         raise EngineValidationError("candidate must contain at least one NAV row")
@@ -1006,6 +1278,12 @@ def summarize_candidate(
         peak = max(peak, value)
         max_drawdown = min(max_drawdown, value / peak - 1 if peak else 0.0)
     total_notional = sum(float(row["gross_notional"]) for row in trade_rows)
+    normalized_actions = [
+        _validated_corporate_action_row(
+            row, f"candidate corporate action row {index}"
+        )
+        for index, row in enumerate(corporate_action_rows)
+    ]
     mean_nav = statistics.mean(nav_values)
     return {
         "starting_nav": nav_values[0],
@@ -1021,6 +1299,12 @@ def summarize_candidate(
         "total_sell_tax": sum(float(row["tax"]) for row in trade_rows),
         "total_slippage_cost": sum(
             float(row["slippage_cost"]) for row in trade_rows
+        ),
+        "corporate_action_entry_count": len(normalized_actions),
+        "total_cash_dividends": sum(
+            float(row["cash_delta"])
+            for row in normalized_actions
+            if row["accounting_event_type"] == "cash_dividend"
         ),
         "turnover_ratio": total_notional / mean_nav if mean_nav > 0 else 0.0,
         "total_return": nav_values[-1] / nav_values[0] - 1,
@@ -1041,6 +1325,7 @@ def write_engine_candidate(
     order_rows: Optional[Sequence[Mapping[str, Any]]] = None,
     event_rows: Optional[Sequence[Mapping[str, Any]]] = None,
     signal_rows: Optional[Sequence[Mapping[str, Any]]] = None,
+    corporate_action_rows: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Path:
     engine_name = engine.get("name")
     engine_version = engine.get("version")
@@ -1202,6 +1487,29 @@ def write_engine_candidate(
             ),
             EVENT_FIELDS,
         )
+    if corporate_action_rows is not None:
+        _write_csv(
+            destination / "corporate_actions.csv",
+            (
+                {
+                    **{field: row[field] for field in CORPORATE_ACTION_FIELDS},
+                    "cash_delta": f"{float(row['cash_delta']):.8f}",
+                    "cash_amount": (
+                        ""
+                        if row.get("cash_amount") is None
+                        else f"{float(row['cash_amount']):.8f}"
+                    ),
+                    "ratio": (
+                        ""
+                        if row.get("ratio") is None
+                        else f"{float(row['ratio']):.12f}"
+                    ),
+                }
+                for row in corporate_action_rows
+            ),
+            CORPORATE_ACTION_FIELDS,
+        )
+        read_corporate_action_rows(destination / "corporate_actions.csv")
     files = {
         name: file_sha256(destination / name)
         for name in ("metrics.json", "nav.csv", "trades.csv")
@@ -1215,6 +1523,10 @@ def write_engine_candidate(
         )
     if signal_rows is not None:
         files["signals.csv"] = file_sha256(destination / "signals.csv")
+    if corporate_action_rows is not None:
+        files["corporate_actions.csv"] = file_sha256(
+            destination / "corporate_actions.csv"
+        )
     manifest: Dict[str, Any] = {
         "artifact_type": "engine_candidate",
         "schema_version": SCHEMA_VERSION,
@@ -1353,7 +1665,11 @@ def _validate_order_lifecycle(
             and events[0]["order_status"] == "PENDING_NEW"
         ) or (
             events[0]["event_type"]
-            in {"order_precheck_reject", "order_tradability_reject"}
+            in {
+                "order_corporate_action_reject",
+                "order_precheck_reject",
+                "order_tradability_reject",
+            }
             and events[0]["order_status"] == "REJECTED"
         )
         if not valid_initial_event:
@@ -1426,6 +1742,7 @@ def _validate_order_lifecycle(
                         }
                     )
             if event_type in {
+                "order_corporate_action_reject",
                 "order_precheck_reject",
                 "order_tradability_reject",
             }:
@@ -1630,7 +1947,10 @@ def _validate_order_lifecycle(
             )
         else:
             expected_trade_status = (
-                "rejected_not_tradable"
+                "rejected_corporate_action"
+                if events[0]["event_type"]
+                == "order_corporate_action_reject"
+                else "rejected_not_tradable"
                 if events[0]["event_type"] == "order_tradability_reject"
                 else "filled"
                 if order["final_status"] == "FILLED"
@@ -1824,6 +2144,95 @@ def _validate_policy_signals(
     }
 
 
+def _validate_corporate_actions(
+    reference_rows: Sequence[Mapping[str, Any]],
+    candidate_rows: Sequence[Mapping[str, Any]],
+    *,
+    money_tolerance: float,
+    ratio_tolerance: float,
+) -> Dict[str, Any]:
+    mismatches: List[Dict[str, Any]] = []
+    if len(reference_rows) != len(candidate_rows):
+        mismatches.append(
+            {
+                "field": "corporate_action_count",
+                "expected": len(reference_rows),
+                "actual": len(candidate_rows),
+            }
+        )
+    exact_fields = (
+        "trading_date",
+        "symbol",
+        "source_event_type",
+        "accounting_event_type",
+        "quantity_delta",
+        "reference_id",
+    )
+    for index, (reference_row, candidate_row) in enumerate(
+        zip(reference_rows, candidate_rows)
+    ):
+        for field in exact_fields:
+            if reference_row[field] != candidate_row[field]:
+                mismatches.append(
+                    {
+                        "corporate_action_index": index,
+                        "field": field,
+                        "expected": reference_row[field],
+                        "actual": candidate_row[field],
+                    }
+                )
+        for field, tolerance in (
+            ("cash_delta", money_tolerance),
+            ("cash_amount", money_tolerance),
+            ("ratio", ratio_tolerance),
+        ):
+            expected = reference_row[field]
+            actual = candidate_row[field]
+            if expected is None or actual is None:
+                if expected is not actual:
+                    mismatches.append(
+                        {
+                            "corporate_action_index": index,
+                            "field": field,
+                            "expected": expected,
+                            "actual": actual,
+                        }
+                    )
+                continue
+            difference = abs(float(expected) - float(actual))
+            if difference > tolerance:
+                mismatches.append(
+                    {
+                        "corporate_action_index": index,
+                        "field": field,
+                        "expected": expected,
+                        "actual": actual,
+                        "difference": difference,
+                        "tolerance": tolerance,
+                    }
+                )
+    return {
+        "passed": not mismatches,
+        "details": {
+            "reference_action_count": len(reference_rows),
+            "candidate_action_count": len(candidate_rows),
+            "reference_explicit_action_count": sum(
+                1
+                for row in reference_rows
+                if row["accounting_event_type"]
+                != "corporate_action_embedded"
+            ),
+            "candidate_explicit_action_count": sum(
+                1
+                for row in candidate_rows
+                if row["accounting_event_type"]
+                != "corporate_action_embedded"
+            ),
+            "mismatches": _differences_limited(mismatches),
+        },
+    }
+
+
 def reconcile_engine_candidate(
     reference_directory: Path,
     candidate_directory: Path,
@@ -1945,10 +2354,15 @@ def reconcile_engine_candidate(
     base_candidate_files = {"metrics.json", "nav.csv", "trades.csv"}
     lifecycle_candidate_files = {"orders.csv", "events.csv"}
     decision_candidate_files = {"signals.csv"}
+    action_candidate_files = {"corporate_actions.csv"}
+    reference_action_rows = _read_reference_corporate_action_rows(
+        reference_directory / "ledger.csv"
+    )
     declared_file_names = set(declared_files)
     lifecycle_present = lifecycle_candidate_files.issubset(declared_file_names)
     decisions_present = decision_candidate_files.issubset(declared_file_names)
-    valid_candidate_file_sets = {
+    actions_present = action_candidate_files.issubset(declared_file_names)
+    base_file_sets = {
         frozenset(base_candidate_files),
         frozenset(base_candidate_files | lifecycle_candidate_files),
         frozenset(base_candidate_files | decision_candidate_files),
@@ -1957,6 +2371,10 @@ def reconcile_engine_candidate(
             | lifecycle_candidate_files
             | decision_candidate_files
         ),
+    }
+    valid_candidate_file_sets = base_file_sets | {
+        frozenset(set(value) | action_candidate_files)
+        for value in base_file_sets
     }
     file_mismatches: List[Dict[str, Any]] = []
     if frozenset(declared_file_names) not in valid_candidate_file_sets:
@@ -1977,10 +2395,19 @@ def reconcile_engine_candidate(
                 "actual": "missing",
             }
         )
+    if reference_action_rows and not actions_present:
+        file_mismatches.append(
+            {
+                "field": "corporate_actions.csv",
+                "expected": "required when the reference contains actions",
+                "actual": "missing",
+            }
+        )
     allowed_candidate_files = (
         base_candidate_files
         | lifecycle_candidate_files
         | decision_candidate_files
+        | action_candidate_files
     )
     for name in sorted(allowed_candidate_files & declared_file_names):
         actual_hash = file_sha256(candidate_directory / name)
@@ -2208,6 +2635,32 @@ def reconcile_engine_candidate(
             )
         )
 
+    corporate_action_summary: Dict[str, Any] = {
+        "present": False,
+        "reference_action_count": len(reference_action_rows),
+    }
+    if actions_present:
+        candidate_action_rows = read_corporate_action_rows(
+            candidate_directory / "corporate_actions.csv"
+        )
+        corporate_action_result = _validate_corporate_actions(
+            reference_action_rows,
+            candidate_action_rows,
+            money_tolerance=money_tolerance,
+            ratio_tolerance=ratio_tolerance,
+        )
+        corporate_action_summary = {
+            "present": True,
+            **corporate_action_result["details"],
+        }
+        checks.append(
+            _check(
+                "corporate_actions",
+                corporate_action_result["passed"],
+                corporate_action_result["details"],
+            )
+        )
+
     reference_metrics = _load_json_object(reference_directory / "metrics.json")
     candidate_metrics = _load_json_object(candidate_directory / "metrics.json")
     if set(candidate_metrics) != set(METRIC_FIELDS):
@@ -2308,6 +2761,7 @@ def reconcile_engine_candidate(
             ),
             "policy_decisions": decision_summary,
             "order_lifecycle": lifecycle_summary,
+            "corporate_actions": corporate_action_summary,
         },
         "investment_validity_established": False,
         "automatic_execution_allowed": False,
