@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -48,7 +52,7 @@ jobs:
         run: >-
           make validate m1-validate m1-demo m15-demo m2-demo
           experiment-verify-demo experiment-replay-demo experiment-compare-demo
-          paper-demo paper-audit-demo PYTHON=python
+          experiment-catalog-demo paper-demo paper-audit-demo PYTHON=python
 
   package:
     name: Package / Python 3.14
@@ -69,7 +73,7 @@ jobs:
       - name: Build distributions
         run: |
           python -m pip install build==1.5.0
-          python -m build
+          make package
       - name: Install wheel
         run: |
           test "$(find dist -maxdepth 1 -name '*.whl' | wc -l | tr -d ' ')" = "1"

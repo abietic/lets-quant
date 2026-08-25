@@ -19,6 +19,17 @@ make vectorbt-test PYTHON=.venv-vectorbt/bin/python
 make rqalpha-test PYTHON=.venv-rqalpha/bin/python
 ```
 
+构建 wheel 和 sdist 使用：
+
+```bash
+python -m pip install -e '.[dev]'
+make package
+```
+
+`make package` 使用 PyPA build 安装的 `pyproject-build` 入口，因此即使仓库中已经
+存在上一次构建留下的 `build/` 目录，也不会被同名目录遮蔽；连续执行必须都能
+成功。可用 `DIST_DIR=/tmp/lets-quant-dist` 将产物写到独立目录。
+
 为当前 clone 启用仓库内的推送门禁：
 
 ```bash
@@ -32,7 +43,9 @@ git config --local --get core.hooksPath
 
 ## 持续集成
 
-[`ci.yml`](../.github/workflows/ci.yml) 在 `main` push、pull request 和人工触发时运行：
+[`ci.yml`](../.github/workflows/ci.yml) 只在 `main` push、以 `main` 为目标的 pull
+request 和人工触发时运行。`v*` 标签只触发 `release.yml`，避免一次原子发布重复
+运行分支 CI、标签 CI 和发布验证：
 
 | job | 范围 |
 |---|---|
@@ -48,12 +61,21 @@ git config --local --get core.hooksPath
 [`rqalpha.yml`](../.github/workflows/rqalpha.yml) 每周一及人工触发时，在独立环境跑
 完整核心门禁、适配器测试和 demo。它们不访问券商、行情供应商或真实账户。
 
+如果所有 matrix job 都在数秒内结束、没有执行任何 step，并显示以下注释：
+
+> The job was not started because recent account payments have failed or your spending limit needs to be increased.
+
+这表示 GitHub 账户的 Billing & plans 门禁阻止 runner 启动，不是源码或测试失败。
+先恢复账户额度/支付状态，再手动重新运行失败的 workflow；在至少一次云端任务真正
+启动并通过前，不要把这些状态检查设为 `main` 的 required checks。
+
 ## 发布
 
 发布顺序保持显式：
 
 1. 更新 `pyproject.toml` 和 `src/lets_quant/__init__.py` 的版本。
-2. 运行核心测试、可选引擎测试、公开 demo 和干净 wheel 安装验证。
+2. 运行核心测试、可选引擎测试、公开 demo 和 `make package` 的干净 wheel 安装
+   验证。
 3. 创建已签名 commit 和已签名 annotated tag。
 4. 原子推送 `main` 与标签，再核对远端分支、tag object 和 peeled commit。
 
