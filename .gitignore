@@ -14,10 +14,8 @@ dist/
 build/
 *.egg-info/
 
-artifacts/runs/
-artifacts/plans/
-artifacts/experiments/
-artifacts/paper/
-artifacts/engine-validation/
+artifacts/
 data/raw/
 data/curated/
+private/
+secrets/

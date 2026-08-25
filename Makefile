@@ -3,9 +3,12 @@ PYPROJECT_BUILD ?= pyproject-build
 DIST_DIR ?= dist
 PYTHONPATH := $(CURDIR)/src
 
-.PHONY: ci package install-git-hooks check compile lint test validate demo plan m1-validate m1-demo m15-demo m2-demo experiment-verify-demo experiment-replay-demo experiment-compare-demo experiment-catalog-demo paper-demo paper-audit-demo vectorbt-test vectorbt-demo rqalpha-test rqalpha-demo
+.PHONY: ci publication-check package install-git-hooks check compile lint test validate demo plan m1-validate m1-demo m15-demo m2-demo experiment-verify-demo experiment-replay-demo experiment-compare-demo experiment-catalog-demo paper-demo paper-audit-demo vectorbt-test vectorbt-demo rqalpha-test rqalpha-demo
 
-ci: lint check
+ci: publication-check lint check
+
+publication-check:
+	$(PYTHON) scripts/check_publication_boundary.py --root .
 
 package:
 	$(PYPROJECT_BUILD) --outdir "$(DIST_DIR)"

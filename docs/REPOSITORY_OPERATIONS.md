@@ -1,6 +1,6 @@
 # 仓库与发布运维
 
-私有 GitHub 仓库是源码和签名标签的远端副本，不是行情、账户或密钥存储。CI
+GitHub 仓库是源码和签名标签的远端副本，不是行情、账户或密钥存储。CI
 只运行离线 fixture；工作流没有写权限，也不读取仓库 Secret。
 
 ## 本地门禁
@@ -11,8 +11,9 @@
 make ci
 ```
 
-它包含 Ruff 静态检查、源码与测试编译，以及基础环境的完整单元测试。可选引擎
-仍可在各自隔离环境执行：
+它包含公开边界检查、Ruff 静态检查、源码与测试编译，以及基础环境的完整单元测试。
+公开边界检查拒绝跟踪真实数据/产物目录、环境文件、私钥文件、常见凭证和本机绝对
+路径。可选引擎仍可在各自隔离环境执行：
 
 ```bash
 make vectorbt-test PYTHON=.venv-vectorbt/bin/python
@@ -86,3 +87,17 @@ request 和人工触发时运行。`v*` 标签只触发 `release.yml`，避免�
 
 Dependabot 每月检查 GitHub Actions 和 Python 依赖。升级 PR 仍必须通过 CI 并由人
 工审阅，不能因来源是 Dependabot 就自动合并。
+
+## 公开发布边界
+
+仓库转为 public 前必须同时满足：
+
+1. `make publication-check` 与 `make ci` 通过。
+2. 使用独立 secret scanner 扫描完整 Git 历史，而不只扫描当前工作树。
+3. 人工检查历史 pull request、Actions 日志和构建产物，因为可见性变更会同时公开
+   这些 GitHub 数据。
+4. 确认 tracked 示例均为合成数据，真实行情的再分发权已经单独评估。
+
+公开披露不可逆：仓库以后即使改回 private，也无法收回已经产生的 clone、fork 或
+外部缓存。真实行情、持仓、账户快照、券商凭证和专有策略只允许保存在 ignored
+本地目录或专用私有存储中。
