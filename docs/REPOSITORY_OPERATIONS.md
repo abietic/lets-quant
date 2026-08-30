@@ -45,8 +45,8 @@ git config --local --get core.hooksPath
 ## 持续集成
 
 [`ci.yml`](../.github/workflows/ci.yml) 只在 `main` push、以 `main` 为目标的 pull
-request 和人工触发时运行。`v*` 标签只触发 `release.yml`，避免一次原子发布重复
-运行分支 CI、标签 CI 和发布验证：
+request 和人工触发时运行。`v*` 标签只触发 `release.yml`，避免合并后的分支 CI
+与标签发布验证重复运行相同任务：
 
 | job | 范围 |
 |---|---|
@@ -77,8 +77,10 @@ request 和人工触发时运行。`v*` 标签只触发 `release.yml`，避免�
 1. 更新 `pyproject.toml` 和 `src/lets_quant/__init__.py` 的版本。
 2. 运行核心测试、可选引擎测试、公开 demo 和 `make package` 的干净 wheel 安装
    验证。
-3. 创建已签名 commit 和已签名 annotated tag。
-4. 原子推送 `main` 与标签，再核对远端分支、tag object 和 peeled commit。
+3. 通过受保护的 `main` pull request 合并已签名 commit，等待 required check 和合并后
+   的分支 CI 通过，并验证远端合并 commit 的签名。
+4. 在已验证的远端 `main` commit 上创建已签名 annotated tag，推送标签，再核对远端
+   tag object、peeled commit 和 `release.yml` 结果。
 
 [`release.yml`](../.github/workflows/release.yml) 会在后续 `v*` 标签上复核标签版本，
 构建 wheel/sdist，在隔离环境执行 CLI smoke test，并上传保留 30 天的构建产物和

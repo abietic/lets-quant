@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "channel": "local_jsonl",
+  "severities": {
+    "critical": {
+      "repeat_interval_seconds": 900,
+      "escalate_after_seconds": 1800
+    },
+    "warning": {
+      "repeat_interval_seconds": 3600,
+      "escalate_after_seconds": 14400
+    }
+  }
+}

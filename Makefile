@@ -3,7 +3,7 @@ PYPROJECT_BUILD ?= pyproject-build
 DIST_DIR ?= dist
 PYTHONPATH := $(CURDIR)/src
 
-.PHONY: ci publication-check package install-git-hooks check compile lint test validate demo plan m1-validate m1-demo m15-demo m2-demo experiment-verify-demo experiment-replay-demo experiment-compare-demo experiment-catalog-demo paper-demo paper-audit-demo vectorbt-test vectorbt-demo rqalpha-test rqalpha-demo
+.PHONY: ci publication-check package install-git-hooks check compile lint test validate demo plan m1-validate m1-demo m15-demo m2-demo experiment-verify-demo experiment-replay-demo experiment-compare-demo experiment-catalog-demo paper-demo paper-audit-demo paper-alert-demo vectorbt-test vectorbt-demo rqalpha-test rqalpha-demo
 
 ci: publication-check lint check
 
@@ -173,6 +173,31 @@ paper-audit-demo:
 		--state "$$state_path" \
 		--audit-input examples/paper/audit_input.json \
 		--report-out artifacts/paper/audit-demo-report.json
+
+paper-alert-demo:
+	@set -eu; \
+	state_path="artifacts/paper/alert-demo-paper-state.json"; \
+	report_path="artifacts/paper/alert-demo-audit-report.json"; \
+	alert_state_path="artifacts/paper/alert-demo-state.json"; \
+	delivery_log_path="artifacts/paper/alert-demo-deliveries.jsonl"; \
+	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant replay-paper-events \
+		--initial-cash 100000 \
+		--events examples/paper/audit_events.jsonl \
+		--state-out "$$state_path" >/dev/null; \
+	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant audit-paper-state \
+		--state "$$state_path" \
+		--audit-input examples/paper/audit_input.json \
+		--report-out "$$report_path" >/dev/null; \
+	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant sync-paper-alerts \
+		--report "$$report_path" \
+		--policy config/paper_alert_policy.example.json \
+		--now 2025-01-03T09:35:30+08:00 \
+		--state-out "$$alert_state_path" >/dev/null; \
+	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m lets_quant dispatch-paper-alerts \
+		--state "$$alert_state_path" \
+		--delivery-log "$$delivery_log_path" \
+		--delivered-at 2025-01-03T09:35:31+08:00 \
+		--state-out "$$alert_state_path"
 
 vectorbt-test:
 	$(PYTHON) -c 'import vectorbt; assert vectorbt.__version__ == "1.1.0"'
