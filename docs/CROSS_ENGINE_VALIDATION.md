@@ -32,7 +32,9 @@ python -m pip install -e '.[rqalpha]'
 ```
 
 项目分别锁定 `vectorbt==1.1.0` 和 `rqalpha==6.3.0`，检测到其他版本会 fail
-closed。版本和 Python 范围可从各自官方仓库核对：
+closed。VectorBT 1.1.0 导入的模板仍包含 `scattermapbox`，而 Plotly 7 已移除该
+trace，因此 `vectorbt` extra 同时约束 `plotly>=4.12,<7`；在上游完成迁移并通过
+适配器验收前不能放宽。版本和 Python 范围可从各自官方仓库核对：
 
 - [VectorBT releases](https://github.com/polakowo/vectorbt/releases)
 - [VectorBT pyproject](https://github.com/polakowo/vectorbt/blob/master/pyproject.toml)

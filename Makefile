@@ -3,7 +3,7 @@ PYPROJECT_BUILD ?= pyproject-build
 DIST_DIR ?= dist
 PYTHONPATH := $(CURDIR)/src
 
-.PHONY: ci publication-check package install-git-hooks check compile lint test validate demo plan m1-validate m1-demo m15-demo m2-demo experiment-verify-demo experiment-replay-demo experiment-compare-demo experiment-catalog-demo paper-demo paper-audit-demo paper-alert-demo vectorbt-test vectorbt-demo rqalpha-test rqalpha-demo
+.PHONY: ci publication-check package install-git-hooks check compile lint test validate demo plan m1-validate m1-demo m15-demo m2-demo experiment-verify-demo experiment-replay-demo experiment-compare-demo experiment-catalog-demo paper-demo paper-audit-demo paper-alert-demo vectorbt-dependency-check vectorbt-test vectorbt-demo rqalpha-test rqalpha-demo
 
 ci: publication-check lint check
 
@@ -199,8 +199,10 @@ paper-alert-demo:
 		--delivered-at 2025-01-03T09:35:31+08:00 \
 		--state-out "$$alert_state_path"
 
-vectorbt-test:
-	$(PYTHON) -c 'import vectorbt; assert vectorbt.__version__ == "1.1.0"'
+vectorbt-dependency-check:
+	$(PYTHON) -c 'from importlib.metadata import version; import vectorbt; assert vectorbt.__version__ == "1.1.0"; plotly_version = version("plotly"); assert int(plotly_version.split(".", 1)[0]) < 7, plotly_version'
+
+vectorbt-test: vectorbt-dependency-check
 	PYTHONPATH="$(PYTHONPATH)" $(PYTHON) -m unittest \
 		tests.test_vectorbt_adapter -v
 
