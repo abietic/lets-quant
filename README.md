@@ -396,6 +396,26 @@ PYTHONPATH=src python3 -m lets_quant audit-paper-state \
 自动执行。输入格式、告警和适配器边界见
 [离线 Paper 运营审计](docs/PAPER_OPERATIONS.md)。
 
+审计告警还可以进入独立的离线运营状态：
+
+```bash
+PYTHONPATH=src python3 -m lets_quant sync-paper-alerts \
+  --report artifacts/paper/audit-demo-report.json \
+  --policy config/paper_alert_policy.example.json \
+  --now 2025-01-03T09:35:30+08:00 \
+  --state-out artifacts/paper/alert-state.json
+
+PYTHONPATH=src python3 -m lets_quant dispatch-paper-alerts \
+  --state artifacts/paper/alert-state.json \
+  --delivery-log artifacts/paper/alert-deliveries.jsonl \
+  --delivered-at 2025-01-03T09:35:31+08:00 \
+  --state-out artifacts/paper/alert-state.json
+```
+
+它支持幂等确认、有限期静默、重复提醒、超时升级和中断恢复，但当前只写本地
+JSONL 回执，不声称外部通知已经送达。完整契约见
+[离线 Paper 告警运营](docs/PAPER_ALERT_OPERATIONS.md)。
+
 ## 输入格式
 
 价格数据必须提供每个交易日的完整价格，不会自动向前填充：
@@ -512,6 +532,7 @@ AKShare 的 MIT 许可是代码许可，不等于其上游行情的再分发或�
 - [实验目录与审核队列](docs/EXPERIMENT_CATALOG.md)
 - [跨引擎验证](docs/CROSS_ENGINE_VALIDATION.md)
 - [离线 Paper 运营审计](docs/PAPER_OPERATIONS.md)
+- [离线 Paper 告警运营](docs/PAPER_ALERT_OPERATIONS.md)
 
 本项目不提供投资建议。接入中国证券市场自动交易前，需要向开户券商确认
 程序化交易权限、报告义务、接口限制和当前监管要求。

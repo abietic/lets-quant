@@ -49,13 +49,23 @@ from .experiment_comparison import (
 from .experiment_replay import replay_experiment_artifacts
 from .experiment_verification import verify_experiment_artifacts
 from .execution import (
+    PaperAlertError,
     PaperAuditError,
     PaperExchange,
     PaperExecutionError,
     audit_paper_exchange,
+    dispatch_local_alerts,
+    load_alert_actions,
+    load_alert_policy,
+    load_alert_state,
+    load_delivery_log,
     load_paper_audit_input,
+    load_paper_audit_report,
     replay_event_file,
+    save_alert_state,
+    save_delivery_log,
     save_paper_audit_report,
+    synchronize_paper_alerts,
 )
 from .models import InstrumentMetadata, MarketData, Policy
 from .orders import build_manual_order_plan
@@ -266,6 +276,28 @@ def build_parser() -> argparse.ArgumentParser:
     paper_audit.add_argument("--state", type=Path, required=True)
     paper_audit.add_argument("--audit-input", type=Path, required=True)
     paper_audit.add_argument("--report-out", type=Path, required=True)
+
+    alert_sync = subcommands.add_parser(
+        "sync-paper-alerts",
+        help="sync a verified paper audit into an offline alert lifecycle",
+    )
+    alert_sync.add_argument("--report", type=Path, required=True)
+    alert_sync.add_argument("--policy", type=Path, required=True)
+    alert_sync.add_argument("--resume-state", type=Path)
+    alert_sync.add_argument("--actions", type=Path)
+    alert_sync.add_argument("--now", type=_timestamp_argument, required=True)
+    alert_sync.add_argument("--state-out", type=Path, required=True)
+
+    alert_dispatch = subcommands.add_parser(
+        "dispatch-paper-alerts",
+        help="deliver pending paper alerts to an idempotent local JSONL sink",
+    )
+    alert_dispatch.add_argument("--state", type=Path, required=True)
+    alert_dispatch.add_argument("--delivery-log", type=Path, required=True)
+    alert_dispatch.add_argument(
+        "--delivered-at", type=_timestamp_argument, required=True
+    )
+    alert_dispatch.add_argument("--state-out", type=Path, required=True)
 
     vectorbt_validation = subcommands.add_parser(
         "validate-vectorbt",
@@ -865,6 +897,75 @@ def _audit_paper_state(args: argparse.Namespace) -> int:
     return 3 if report["status"] == "blocked" else 0
 
 
+def _sync_paper_alerts(args: argparse.Namespace) -> int:
+    report = load_paper_audit_report(args.report)
+    policy = load_alert_policy(args.policy)
+    previous_state = (
+        load_alert_state(args.resume_state) if args.resume_state else None
+    )
+    actions = load_alert_actions(args.actions) if args.actions else []
+    state = synchronize_paper_alerts(
+        report,
+        policy,
+        args.now,
+        previous_state=previous_state,
+        actions=actions,
+    )
+    save_alert_state(state, args.state_out)
+    active = [item for item in state["alerts"] if item["status"] != "resolved"]
+    active_critical = [
+        item for item in active if item["severity"] == "critical"
+    ]
+    print(
+        json.dumps(
+            {
+                "status": "blocked" if active_critical else "ready",
+                "execution_mode": "offline_paper",
+                "automatic_execution_allowed": False,
+                "automatic_external_delivery_allowed": False,
+                "state_path": str(args.state_out.resolve()),
+                "state_sha256": state["state_sha256"],
+                "active_alert_count": len(active),
+                "active_critical_alert_count": len(active_critical),
+                "pending_notification_count": len(
+                    state["pending_notifications"]
+                ),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 3 if active_critical else 0
+
+
+def _dispatch_paper_alerts(args: argparse.Namespace) -> int:
+    state = load_alert_state(args.state)
+    existing_receipts = load_delivery_log(args.delivery_log)
+    pending_count = len(state["pending_notifications"])
+    updated, receipts = dispatch_local_alerts(
+        state, existing_receipts, args.delivered_at
+    )
+    save_delivery_log(receipts, args.delivery_log)
+    save_alert_state(updated, args.state_out)
+    print(
+        json.dumps(
+            {
+                "status": "completed",
+                "delivery_mode": "offline_local_jsonl",
+                "automatic_external_delivery_allowed": False,
+                "state_path": str(args.state_out.resolve()),
+                "state_sha256": updated["state_sha256"],
+                "delivery_log_path": str(args.delivery_log.resolve()),
+                "dispatched_notification_count": pending_count,
+                "delivery_receipt_count": len(receipts),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def _validate_vectorbt(args: argparse.Namespace) -> int:
     destination, report = run_vectorbt_validation(
         reference_directory=args.reference_run,
@@ -985,6 +1086,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _replay_paper_events(args)
         if args.command == "audit-paper-state":
             return _audit_paper_state(args)
+        if args.command == "sync-paper-alerts":
+            return _sync_paper_alerts(args)
+        if args.command == "dispatch-paper-alerts":
+            return _dispatch_paper_alerts(args)
         if args.command == "validate-vectorbt":
             return _validate_vectorbt(args)
         if args.command == "validate-rqalpha":
@@ -995,6 +1100,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         DataError,
         EngineValidationError,
         ExperimentError,
+        PaperAlertError,
         PaperAuditError,
         PaperExecutionError,
         PolicyError,
