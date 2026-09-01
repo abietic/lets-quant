@@ -4,6 +4,15 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "17 3 * * 1"
+  pull_request:
+    paths:
+      - ".github/workflows/vectorbt.yml"
+      - "Makefile"
+      - "pyproject.toml"
+      - "src/lets_quant/**"
+      - "tests/test_vectorbt_adapter.py"
+      - "config/**"
+      - "examples/**"
 
 permissions:
   contents: read
