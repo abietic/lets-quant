@@ -19,7 +19,7 @@ dependencies = []
 akshare = ["akshare==1.18.79"]
 dev = [
   "build==1.4.2; python_version < '3.10'",
-  "build==1.5.0; python_version >= '3.10'",
+  "build==1.6.0; python_version >= '3.10'",
   "ruff==0.16.4",
 ]
 vectorbt = [
