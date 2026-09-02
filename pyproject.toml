@@ -16,7 +16,7 @@ authors = [
 dependencies = []
 
 [project.optional-dependencies]
-akshare = ["akshare==1.18.79"]
+akshare = ["akshare==1.18.88"]
 dev = [
   "build==1.4.2; python_version < '3.10'",
   "build==1.5.0; python_version >= '3.10'",
