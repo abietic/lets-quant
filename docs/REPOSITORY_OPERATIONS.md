@@ -59,8 +59,10 @@ request 和人工触发时运行。`v*` 标签只触发 `release.yml`，避免�
 官方发布 commit。
 
 [`vectorbt.yml`](../.github/workflows/vectorbt.yml) 和
-[`rqalpha.yml`](../.github/workflows/rqalpha.yml) 每周一及人工触发时，在独立环境跑
-完整核心门禁、适配器测试和 demo。它们不访问券商、行情供应商或真实账户。
+[`rqalpha.yml`](../.github/workflows/rqalpha.yml) 在相关依赖、共享源码、适配器测试、
+配置、示例或工作流发生 pull request 变更时，以及每周一和人工触发时，在独立环境
+跑完整核心门禁、适配器测试和 demo。纯文档变更不会启动这些可选环境；所有任务都不
+访问券商、行情供应商或真实账户。
 
 如果所有 matrix job 都在数秒内结束、没有执行任何 step，并显示以下注释：
 

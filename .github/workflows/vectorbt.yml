@@ -4,6 +4,15 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "17 3 * * 1"
+  pull_request:
+    paths:
+      - ".github/workflows/vectorbt.yml"
+      - "Makefile"
+      - "pyproject.toml"
+      - "src/lets_quant/**"
+      - "tests/test_vectorbt_adapter.py"
+      - "config/**"
+      - "examples/**"
 
 permissions:
   contents: read
@@ -33,6 +42,8 @@ jobs:
           cache-dependency-path: pyproject.toml
       - name: Install package and VectorBT adapter
         run: python -m pip install -e '.[dev,vectorbt]'
+      - name: Verify VectorBT dependency boundary
+        run: make vectorbt-dependency-check PYTHON=python
       - name: Run core checks
         run: make ci PYTHON=python
       - name: Run VectorBT instrument, opening-state, and action acceptance
